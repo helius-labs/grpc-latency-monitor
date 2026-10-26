@@ -14,6 +14,96 @@ use tokio::sync::mpsc;
 use crate::config::SubscriberConfig;
 use crate::model::{self, Commitment, DataType, EventKey, StorageRecord, StreamKind};
 
+/// Durable minute IDs, not a row spool. Keep the directory on persistent storage.
+/// A failed database intent (including an ambiguous response) must survive restart
+/// too, so this file is synced before any insert and cleared only after all acks.
+pub struct WriteJournal {
+    file: std::fs::File,
+    pending: Vec<u32>,
+}
+
+impl WriteJournal {
+    pub async fn open(directory: &std::path::Path, identity: &[&str]) -> anyhow::Result<Self> {
+        let mut hash = blake3::Hasher::new();
+        for field in identity {
+            hash.update(&(field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+        let directory = directory.to_path_buf();
+        let key = hash.finalize().to_hex();
+        let (file, pending) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            use std::io::Read;
+            std::fs::create_dir_all(&directory)?;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.join(format!("{key}.pending")))?;
+            file.try_lock()
+                .context("another writer owns this recovery journal")?;
+            // Persist the directory entry as well as later file contents.
+            #[cfg(unix)]
+            std::fs::File::open(&directory)?.sync_all()?;
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            let pending = text
+                .lines()
+                .map(str::parse)
+                .collect::<Result<Vec<u32>, _>>()
+                .context(
+                    "invalid pending-write journal; preserve it and investigate before restarting",
+                )?;
+            Ok((file, pending))
+        })
+        .await??;
+        Ok(Self { file, pending })
+    }
+
+    async fn record(&mut self, minutes: Vec<u32>) -> anyhow::Result<()> {
+        let text: String = minutes.iter().map(|minute| format!("{minute}\n")).collect();
+        let mut file = self.file.try_clone()?;
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::{Seek, Write};
+            file.rewind()?;
+            file.write_all(text.as_bytes())?;
+            file.set_len(text.len() as u64)?;
+            file.sync_all()
+        })
+        .await??;
+        self.pending = minutes;
+        Ok(())
+    }
+
+    pub async fn recover(
+        &mut self,
+        client: &Client,
+        subscriber: &SubscriberConfig,
+    ) -> anyhow::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        tracing::warn!(minutes = self.pending.len(), region = %subscriber.region,
+            cloud_provider = %subscriber.cloud_provider,
+            "Recovering unacknowledged raw minutes as unknown");
+        let rows: Vec<_> = self
+            .pending
+            .iter()
+            .map(|&bucket| IntentRow {
+                region: subscriber.region.clone(),
+                cloud_provider: subscriber.cloud_provider.clone(),
+                bucket,
+                expected: 0,
+                incomplete: 1,
+            })
+            .collect();
+        insert_rows(client, "benchmark_dirty_minutes", &rows)
+            .await
+            .context("marking unacknowledged write minutes unknown before restarting")?;
+        self.record(Vec::new()).await
+    }
+}
+
 /// Ordered account/processed, account/finalized, transaction/processed,
 /// transaction/finalized, slot/processed, slot/finalized.
 /// `filters` is the normalized subscription request/filter description used to form `id`.
@@ -97,6 +187,36 @@ struct VersionRow {
     registered_utc: OffsetDateTime,
 }
 
+/// Acknowledged before any raw insert. Unmatched counts permanently withhold a
+/// minute after a rejected or partially accepted insert; no retry can certify it.
+#[derive(Row, Serialize, Debug)]
+struct IntentRow {
+    region: String,
+    cloud_provider: String,
+    bucket: u32,
+    expected: u64,
+    incomplete: u64,
+}
+
+fn write_intents(ctx: &Context, lags: &[LagRow]) -> Result<Vec<IntentRow>, String> {
+    let mut counts = std::collections::BTreeMap::new();
+    for lag in lags {
+        let bucket = u32::try_from(lag.event_utc.unix_timestamp().div_euclid(60) * 60)
+            .map_err(|_| "event minute is outside ClickHouse DateTime range".to_string())?;
+        *counts.entry(bucket).or_insert(0_u64) += 1;
+    }
+    Ok(counts
+        .into_iter()
+        .map(|(bucket, expected)| IntentRow {
+            region: ctx.region.clone(),
+            cloud_provider: ctx.cloud_provider.clone(),
+            bucket,
+            expected,
+            incomplete: 0,
+        })
+        .collect())
+}
+
 #[derive(Row, Serialize, Debug)]
 struct SubscriberRow {
     region: String,
@@ -164,6 +284,7 @@ pub async fn validate_schema(client: &Client) -> anyhow::Result<()> {
         check_row::<ConnectionRow>(&client, "benchmark_connection_events").await?;
         check_row::<VersionRow>(&client, "benchmark_subscription_versions").await?;
         check_row::<HealthRow>(&client, "benchmark_measurement_health").await?;
+        check_row::<IntentRow>(&client, "benchmark_dirty_minutes").await?;
         check_row::<SubscriberRow>(&client, "benchmark_subscriber_locations").await
     })
     .await
@@ -374,6 +495,7 @@ async fn insert_rows_with_timeouts<T: RowOwned + RowWrite>(
 
 async fn flush(
     client: &Client,
+    journal: &mut WriteJournal,
     ctx: &Context,
     pending: &mut Vec<StorageRecord>,
     summary: &mut WriteSummary,
@@ -399,6 +521,16 @@ async fn flush(
             StorageRecord::Coverage(row) => gaps.push(ctx.coverage(row).map_err(failure)?),
         }
     }
+    let intents = write_intents(ctx, &lags).map_err(failure)?;
+    if !intents.is_empty() {
+        journal
+            .record(intents.iter().map(|row| row.bucket).collect())
+            .await
+            .map_err(|e| failure(format!("recording pending raw minutes failed: {e:#}")))?;
+    }
+    insert_rows(client, "benchmark_dirty_minutes", &intents)
+        .await
+        .map_err(|e| failure(format!("raw write intent failed: {e}")))?;
     insert_rows(client, "benchmark_event_lags", &lags)
         .await
         .map_err(|e| failure(format!("benchmark_event_lags insert failed: {e}")))?;
@@ -408,6 +540,12 @@ async fn flush(
     insert_rows(client, "benchmark_measurement_health", &gaps)
         .await
         .map_err(|e| failure(format!("benchmark_measurement_health insert failed: {e}")))?;
+    if !intents.is_empty() {
+        journal
+            .record(Vec::new())
+            .await
+            .map_err(|e| failure(format!("clearing acknowledged raw minutes failed: {e:#}")))?;
+    }
     summary.records += pending.len() as u64;
     summary.batches += 1;
     pending.clear();
@@ -419,8 +557,10 @@ async fn flush(
 /// stops consuming immediately and returns an error including the unacknowledged batch.
 /// The caller must treat the remaining receiver contents and any interval after failure
 /// as unknown. Use bounded retry/restart supervision outside this sink, not silent retries.
+#[allow(clippy::too_many_arguments)]
 pub async fn write(
     client: Client,
+    mut journal: WriteJournal,
     cloud_provider: String,
     region: String,
     providers: Vec<String>,
@@ -433,6 +573,11 @@ pub async fn write(
         unacknowledged_records: 0,
         first_unacknowledged_utc: None,
     };
+    if !journal.pending.is_empty() {
+        return Err(invalid(
+            "pending-write recovery must complete before ingestion",
+        ));
+    }
     if cloud_provider.is_empty()
         || region.is_empty()
         || providers.is_empty()
@@ -500,17 +645,17 @@ pub async fn write(
                 Some(record) => {
                     pending.push(record);
                     if pending.len() == limits.max_records {
-                        flush(&client, &ctx, &mut pending, &mut summary).await?;
+                        flush(&client, &mut journal, &ctx, &mut pending, &mut summary).await?;
                         timer.as_mut().reset(tokio::time::Instant::now() + limits.flush_interval);
                     }
                 }
                 None => {
-                    flush(&client, &ctx, &mut pending, &mut summary).await?;
+                    flush(&client, &mut journal, &ctx, &mut pending, &mut summary).await?;
                     return Ok(summary);
                 }
             },
             _ = &mut timer => {
-                flush(&client, &ctx, &mut pending, &mut summary).await?;
+                flush(&client, &mut journal, &ctx, &mut pending, &mut summary).await?;
                 timer.as_mut().reset(tokio::time::Instant::now() + limits.flush_interval);
             }
         }
@@ -520,6 +665,130 @@ pub async fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_minutes_survive_restart_and_journal_has_one_owner() {
+        let directory = std::env::temp_dir().join(format!(
+            "benchmark-journal-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut journal = WriteJournal::open(&directory, &["test-database", "test-region"])
+            .await
+            .unwrap();
+        journal.record(vec![120, 180]).await.unwrap();
+        assert!(
+            WriteJournal::open(&directory, &["test-database", "test-region"])
+                .await
+                .is_err()
+        );
+        drop(journal);
+        let mut recovered = WriteJournal::open(&directory, &["test-database", "test-region"])
+            .await
+            .unwrap();
+        assert_eq!(recovered.pending, [120, 180]);
+        recovered.record(Vec::new()).await.unwrap();
+        drop(recovered);
+        let cleared = WriteJournal::open(&directory, &["test-database", "test-region"])
+            .await
+            .unwrap();
+        assert!(cleared.pending.is_empty());
+        drop(cleared);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // Run by test:rollups in a disposable database with production table types
+    // and a constraint that rejects the final missed row after its intent lands.
+    #[tokio::test]
+    #[ignore = "requires the disposable ClickHouse fixture created by test:rollups"]
+    async fn failed_final_batch_fixture() -> anyhow::Result<()> {
+        let database = std::env::var("BENCH_CH_DATABASE")?;
+        anyhow::ensure!(database.starts_with("benchmark_rollup_test_"));
+        let client = Client::default()
+            .with_url(std::env::var("BENCH_CH_URL")?)
+            .with_database(&database)
+            .with_user(std::env::var("BENCH_CH_USER")?)
+            .with_password(std::env::var("BENCH_CH_PASSWORD")?);
+        validate_schema(&client).await?;
+        let mut journal = WriteJournal::open(
+            std::path::Path::new(&std::env::var("BENCH_TEST_STATE_DIR")?),
+            &[&database],
+        )
+        .await?;
+        if std::env::var("BENCH_TEST_RECOVER").as_deref() == Ok("1") {
+            let subscriber = SubscriberConfig {
+                region: "us-east".into(),
+                cloud_provider: "example-cloud".into(),
+                latitude: 0.,
+                longitude: 0.,
+            };
+            journal.recover(&client, &subscriber).await?;
+            return Ok(());
+        }
+        let first = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs()
+                    / 60
+                    * 60
+                    + 1,
+            );
+        let kind = stream(DataType::Slot);
+        let (tx, rx) = mpsc::channel(3);
+        for (provider, outcome) in [(0, model::Outcome::OnTime), (1, model::Outcome::Missed)] {
+            tx.send(StorageRecord::Lag(model::LagRecord {
+                message_bytes: None,
+                stream: kind,
+                key: EventKey::Slot {
+                    slot: 100,
+                    status: 0,
+                },
+                first_utc: first,
+                provider,
+                outcome,
+                lag_ns: (provider == 0).then_some(0),
+            }))
+            .await?;
+            if provider == 0 {
+                tx.send(StorageRecord::Coverage(model::CoverageRecord {
+                    stream: kind,
+                    provider: 1,
+                    start: first - Duration::from_secs(1),
+                    end: first + Duration::from_secs(59),
+                }))
+                .await?;
+            }
+        }
+        drop(tx);
+        let ctx = context();
+        let error = write(
+            client,
+            journal,
+            ctx.cloud_provider,
+            ctx.region,
+            ctx.providers,
+            ctx.versions,
+            rx,
+            BatchLimits {
+                max_records: 1,
+                flush_interval: Duration::from_secs(3600),
+            },
+        )
+        .await
+        .expect_err("the final raw insert must be rejected");
+        let expected_error = if std::env::var("BENCH_TEST_FAIL_INTENT").as_deref() == Ok("1") {
+            "raw write intent failed"
+        } else {
+            "benchmark_event_lags insert failed"
+        };
+        anyhow::ensure!(error.message.contains(expected_error), "{error}");
+        anyhow::ensure!(error.unacknowledged_records == 1);
+        Ok(())
+    }
     fn stream(data_type: DataType) -> StreamKind {
         StreamKind {
             data_type,

@@ -62,15 +62,15 @@ impl SlotFates {
         }
     }
 
-    /// Any provider's confirmation decides a slot. Without one, a slot is forked
-    /// once a provider reports it dead or finalizes a later slot: a provider sends a
-    /// slot's confirmation before finalizing a later one, and slot updates are
-    /// recorded in each provider's order.
+    /// A later finalization cannot decide an earlier slot: independent slot
+    /// workers can process it before that slot's queued confirmation. Undecided
+    /// slots remain pending until confirmation, an explicit dead status, or the
+    /// filter's bounded timeout. The finalized watermark only bounds retention.
     pub fn fate(&self, slot: u64) -> Fate {
         let fates = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if fates.confirmed.contains(&slot) {
             Fate::Confirmed
-        } else if fates.dead.contains(&slot) || fates.finalized.is_some_and(|f| f > slot) {
+        } else if fates.dead.contains(&slot) {
             Fate::Forked
         } else {
             Fate::Unknown
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_or_passed_slots_are_forked() {
+    fn finalization_does_not_overtake_a_queued_confirmation() {
         let fates = SlotFates::default();
         let mut filter = ForkFilter::new(Duration::from_secs(30), 100);
         let t = Instant::now();
@@ -252,16 +252,15 @@ mod tests {
         assert!(filter.filter(held, t, &fates).is_empty());
         fates.record(11, DEAD);
         fates.record(12, FINALIZED);
-        // 12 finalized: 10 and 11 can no longer confirm; 13 is still open.
+        // Another worker's finalization must not resolve slot 10 prematurely.
         let rows = filter.filter(vec![], t, &fates);
         assert_eq!(
             outcomes(&rows),
-            [
-                (10, 1, Outcome::Forked),
-                (11, 1, Outcome::Forked),
-                (12, 1, Outcome::Missed),
-            ]
+            [(11, 1, Outcome::Forked), (12, 1, Outcome::Missed),]
         );
+        fates.record(10, CONFIRMED);
+        let rows = filter.filter(vec![], t + Duration::from_secs(1), &fates);
+        assert_eq!(outcomes(&rows), [(10, 1, Outcome::Missed)]);
         let rows = filter.filter(vec![], t + Duration::from_secs(30), &fates);
         assert_eq!(outcomes(&rows), [(13, 1, Outcome::Forked)]);
     }
@@ -303,7 +302,7 @@ mod tests {
         let fates = SlotFates::default();
         fates.record(5, CONFIRMED);
         fates.record(RETAINED_SLOTS + 10, FINALIZED);
-        assert_eq!(fates.fate(5), Fate::Forked);
+        assert_eq!(fates.fate(5), Fate::Unknown);
         assert_eq!(fates.fate(RETAINED_SLOTS + 10), Fate::Confirmed);
         assert_eq!(fates.fate(RETAINED_SLOTS + 11), Fate::Unknown);
     }

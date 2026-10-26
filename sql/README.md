@@ -42,7 +42,7 @@ credentials privately; do not commit them. Goose stores migration history in
 history. Run one benchmark migration process per database as a deployment step,
 before starting subscribers. The migration user needs privileges
 for migration DDL and reading/writing Goose's history table. The application user
-needs INSERT and DESCRIBE on the five ingestion/metadata tables, SELECT on event
+needs INSERT and DESCRIBE on the five ingestion/metadata tables and dirty minutes, SELECT on event
 lags, dirty minutes and rollup commits, INSERT on minute rollups and rollup
 commits, and ALTER DELETE on minute rollups (lightweight deletes of superseded
 summary generations). It does not need other DDL privileges or access to Goose's history.
@@ -181,7 +181,7 @@ After a crash, the next startup catches up on retained, eligible dirty minutes.
 
 The subscriber's ClickHouse user needs SELECT on raw, dirty-minute and commit
 tables, INSERT on minute summaries and commits, and ALTER DELETE on minute summaries,
-in addition to its existing writer permissions. The dirty-minute view must also be allowed to write its target
+in addition to its existing writer permissions, including INSERT and DESCRIBE on dirty minutes. The dirty-minute view must also be allowed to write its target
 under the deployment's ClickHouse view security policy. Configuration is unchanged.
 
 The worker recomputes a complete event-time minute from raw rows. It deduplicates
@@ -199,6 +199,26 @@ so a dashboard query that captured the previous manifest can still finish. Rows 
 its first arrival), so the last seconds of a minute arrive after it ends; those inserts
 mark the event-time minute dirty and trigger a rebuild.
 
+Dirty revisions are cumulative inserted-row counts, summed by `SummingMergeTree`,
+so even a one-row insert after a larger published revision invalidates it. Revisions
+do not use wall clocks. Before each raw insert, the writer inserts and acknowledges
+the expected number of rows for every affected minute. When expected rows exceed
+inserted rows, that minute is incomplete and stays excluded from summaries, raw
+dashboard fallback and the coverage gate across restarts. The counters outlive the
+summaries they invalidate. A subsequent successful batch adds equal counts to both
+sides and cannot repair a previous deficit. Only the subscriber may write raw rows;
+manual inserts or blind retries could conceal a deficit. Missing rows cannot be
+recovered by rebuilding a summary.
+
+Before sending the expected-row insert, the writer syncs pending minute IDs to
+its local `state_dir` journal. Startup marks any journaled minutes with a sticky
+`incomplete` count before starting ingestion or rollups, then clears the journal
+only after that marker is acknowledged. This also covers failure before the
+database intent is acknowledged. Preserve `state_dir` across restarts; see
+[operations](../docs/operations.md). A positive `incomplete` count excludes a minute
+regardless of its row counts. Live batch tracking adds one small intent INSERT
+and two local file syncs to each batch containing raw rows.
+
 Dashboard queries capture one manifest snapshot. Unbuilt/dirty minutes and partial
 range boundaries use raw rows; committed fully contained minutes use summaries.
 This also preserves latest-subscription selection separately for every stream and
@@ -209,7 +229,9 @@ A closed minute is first built after a settle delay of `window + processing_grac
 flush_interval + 6 s` (14 seconds with the example configuration): the last windows of
 a minute close and are inserted after it ends, so building sooner would rebuild almost
 every minute and retain the superseded generation for 30 days. At shutdown, after the
-writer flushes, all minutes including the open one are built immediately.
+writer and matchers finish successfully, all complete minutes including the open
+one are built immediately. Failed ingestion suppresses that final pass; incomplete
+minutes remain excluded on later startups as well.
 
 During normal operation, the task builds closed minutes newer than five hours to avoid
 racing raw TTL deletion during a long build. **Alert well before worker lag reaches
@@ -304,11 +326,13 @@ Monitor subscriber rollup logs, query failures and `system.query_log.memory_usag
 To find unprocessed closed minutes:
 
 ```sql
-SELECT d.region, d.cloud_provider, d.bucket, d.revision, c.revision AS published_revision
-FROM (SELECT region, cloud_provider, bucket, max(revision) revision FROM benchmark_dirty_minutes GROUP BY region, cloud_provider, bucket) d
+SELECT d.region, d.cloud_provider, d.bucket, d.revision, d.expected,
+       d.expected > d.revision OR d.incomplete > 0 AS incomplete, c.revision AS published_revision
+FROM (SELECT region, cloud_provider, bucket, sum(revision) revision, sum(expected) expected,
+      sum(incomplete) incomplete FROM benchmark_dirty_minutes GROUP BY region, cloud_provider, bucket) d
 LEFT JOIN (SELECT region, cloud_provider, bucket, argMax(revision, generation) revision FROM benchmark_rollup_commits GROUP BY region, cloud_provider, bucket) c
 ON d.region = c.region AND d.cloud_provider = c.cloud_provider AND d.bucket = c.bucket
-WHERE d.bucket < toStartOfMinute(now()) AND d.revision > c.revision
+WHERE d.bucket < toStartOfMinute(now()) AND (d.revision > c.revision OR d.expected > d.revision OR d.incomplete > 0)
 ORDER BY d.bucket;
 ```
 

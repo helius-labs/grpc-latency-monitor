@@ -16,7 +16,10 @@ use crate::{
     config::Config,
     forks::{ForkFilter, SlotFates},
     matcher::Matcher,
-    model::{Arrival, Commitment, CoverageRecord, DataType, EventKey, StorageRecord, StreamKind},
+    model::{
+        Arrival, Commitment, CoverageRecord, DataType, EventKey, GapRecord, StorageRecord,
+        StreamKind,
+    },
     stream::{InFlight, StreamControl},
 };
 
@@ -45,6 +48,9 @@ struct StreamState {
     /// A stale arrival invalidates open comparisons at most once per tick:
     /// repeating the full scan per arrival would make a backlog quadratic.
     stale_invalidated: bool,
+    storage_stalled: bool,
+    /// A recovered storage stall must not restart coverage inside the stall.
+    healthy_after: Option<(Instant, SystemTime)>,
     /// Slot streams record slot statuses; processed account and transaction
     /// streams hold their misses until the slot's fate is known.
     fates: Arc<SlotFates>,
@@ -75,9 +81,57 @@ impl StreamState {
             connected: vec![false; count],
             connection_warmup: config.connection_warmup,
             stale_invalidated: false,
+            storage_stalled: false,
+            healthy_after: None,
             fates,
             forks,
         }
+    }
+
+    fn coverage_start(&self, at: Instant, utc: SystemTime) -> Coverage {
+        let (start, start_utc) = self
+            .healthy_after
+            .filter(|(after, _)| *after > at)
+            .unwrap_or((at, utc));
+        Coverage {
+            start,
+            start_utc,
+            certified: None,
+        }
+    }
+
+    /// Observe saturation at the send itself, before capacity can recover. Keep
+    /// accepted rows, flush only previously certified time, and withhold health
+    /// until a subsequent clean tick after the last blocked send completes.
+    async fn send_rows(
+        &mut self,
+        tx: &mpsc::Sender<StorageRecord>,
+        rows: Vec<StorageRecord>,
+    ) -> Result<()> {
+        let mut rows = std::collections::VecDeque::from(rows);
+        while let Some(row) = rows.pop_front() {
+            match tx.try_send(row) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    anyhow::bail!("storage writer stopped")
+                }
+                Err(mpsc::error::TrySendError::Full(row)) => {
+                    if !self.storage_stalled {
+                        rows.extend(self.lose_health(None));
+                        rows.push_back(StorageRecord::Gap(GapRecord {
+                            stream: self.kind,
+                            provider: None,
+                            utc: SystemTime::now(),
+                            reason: "storage queue full".into(),
+                        }));
+                    }
+                    self.storage_stalled = true;
+                    tx.send(row).await.context("storage writer stopped")?;
+                    self.healthy_after = Some((Instant::now(), SystemTime::now()));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// On shutdown, write certified time still pending and undecided misses (as
@@ -138,11 +192,9 @@ impl StreamState {
                 let mut rows = self.lose_health(Some(provider));
                 self.connected[provider] = true;
                 // Healthy coverage starts with miss eligibility, after warmup.
-                self.coverage[provider] = Some(Coverage {
-                    start: at + self.connection_warmup,
-                    start_utc: utc + self.connection_warmup,
-                    certified: None,
-                });
+                self.coverage[provider] = Some(
+                    self.coverage_start(at + self.connection_warmup, utc + self.connection_warmup),
+                );
                 rows.extend(
                     self.matcher
                         .connection_change(provider, at, utc, true, reason),
@@ -236,12 +288,14 @@ pub async fn match_stream(
             let Ok(control) = controls.try_recv() else {
                 break;
             };
-            send_rows(&storage, state.control(control)).await?;
+            let rows = state.control(control);
+            state.send_rows(&storage, rows).await?;
         }
         tokio::select! {
             biased;
             Ok(()) = stop.changed() => {
-                send_rows(&storage, state.stop()).await?;
+                let rows = state.stop();
+                state.send_rows(&storage, rows).await?;
                 return Ok(());
             }
             _ = tick.tick() => {
@@ -258,23 +312,29 @@ pub async fn match_stream(
                 // stamp older than the cutoff can change a window closing now.
                 for _ in 0..controls.len() {
                     let Ok(control) = controls.try_recv() else { break };
-                    send_rows(&storage, state.control(control)).await?;
+                    let rows = state.control(control);
+                    state.send_rows(&storage, rows).await?;
                 }
                 for _ in 0..arrivals.len() {
                     let Ok(arrival) = arrivals.try_recv() else { break };
-                    send_rows(&storage, state.arrival(arrival, config.processing_grace)).await?;
+                    let rows = state.arrival(arrival, config.processing_grace);
+                    state.send_rows(&storage, rows).await?;
                 }
                 if stalled {
-                    send_rows(&storage, state.matcher.invalidate_open(
+                    let rows = state.matcher.invalidate_open(
                         None, now, utc, "reader stalled beyond processing grace",
-                    )).await?;
+                    );
+                    state.send_rows(&storage, rows).await?;
                 }
-                send_rows(&storage, state.close(end, now)).await?;
+                let rows = state.close(end, now);
+                state.send_rows(&storage, rows).await?;
                 state.stale_invalidated = false;
                 // A full storage queue delays rows but cannot change results; it
                 // only withholds health certification.
-                if stalled || storage.capacity() == 0 {
-                    send_rows(&storage, state.lose_health(None)).await?;
+                if stalled || state.storage_stalled || storage.capacity() == 0 {
+                    state.storage_stalled = false;
+                    let rows = state.lose_health(None);
+                    state.send_rows(&storage, rows).await?;
                     continue;
                 }
                 for provider in 0..count {
@@ -285,9 +345,7 @@ pub async fn match_stream(
                             // start before the provider's connection warmup ends.
                             let warmup = state.matcher.eligible_since(provider)
                                 .map_or(Duration::ZERO, |since| since.saturating_duration_since(end));
-                            state.coverage[provider] = Some(Coverage {
-                                start: end + warmup, start_utc: end_utc + warmup, certified: None,
-                            });
+                            state.coverage[provider] = Some(state.coverage_start(end + warmup, end_utc + warmup));
                         }
                         continue;
                     };
@@ -295,15 +353,18 @@ pub async fn match_stream(
                         continue;
                     }
                     if coverage.start_utc > end_utc {
-                        send_rows(&storage, state.lose_health(Some(provider))).await?;
-                        send_rows(&storage, state.matcher.invalidate_open(Some(provider), now, utc, "wall clock discontinuity")).await?;
+                        let rows = state.lose_health(Some(provider));
+                        state.send_rows(&storage, rows).await?;
+                        let rows = state.matcher.invalidate_open(Some(provider), now, utc, "wall clock discontinuity");
+                        state.send_rows(&storage, rows).await?;
                         continue;
                     }
                     coverage.certified = Some(end_utc);
+                    let mut row = None;
                     if end.duration_since(coverage.start) >= coverage_every {
-                        storage.send(StorageRecord::Coverage(CoverageRecord {
+                        row = Some(StorageRecord::Coverage(CoverageRecord {
                             stream: kind, provider, start: coverage.start_utc, end: end_utc,
-                        })).await.context("storage writer stopped")?;
+                        }));
                         coverage.certified = None;
                         if end.duration_since(coverage.start) >= config.window {
                             coverage.start = end - config.window;
@@ -311,25 +372,22 @@ pub async fn match_stream(
                         }
                     }
                     state.coverage[provider] = Some(coverage);
+                    state.send_rows(&storage, row.into_iter().collect()).await?;
+                    if state.storage_stalled { break; }
                 }
             }
             control = controls.recv() => {
                 let control = control.context("control channel closed")?;
-                send_rows(&storage, state.control(control)).await?;
+                let rows = state.control(control);
+                state.send_rows(&storage, rows).await?;
             }
             arrival = arrivals.recv() => {
                 let arrival = arrival.context("arrival channel closed")?;
-                send_rows(&storage, state.arrival(arrival, config.processing_grace)).await?;
+                let rows = state.arrival(arrival, config.processing_grace);
+                state.send_rows(&storage, rows).await?;
             }
         }
     }
-}
-
-async fn send_rows(tx: &mpsc::Sender<StorageRecord>, rows: Vec<StorageRecord>) -> Result<()> {
-    for row in rows {
-        tx.send(row).await.context("storage writer stopped")?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -337,6 +395,54 @@ mod tests {
     use super::*;
     use crate::model::Outcome;
     use yellowstone_grpc_proto::geyser::SlotStatus;
+
+    #[tokio::test(start_paused = true)]
+    async fn storage_stall_breaks_coverage_even_when_capacity_recovers_before_tick() {
+        let config = Config::example();
+        let mut state = StreamState::new(test_kind(), 2, &config, Arc::default());
+        let at = Instant::now() - Duration::from_secs(20);
+        let utc = SystemTime::now() - Duration::from_secs(20);
+        for provider in 0..2 {
+            state.control(connected(provider, at, utc));
+            state.coverage[provider].as_mut().unwrap().certified =
+                Some(utc + Duration::from_secs(10));
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+        let row = StorageRecord::Gap(GapRecord {
+            stream: test_kind(),
+            provider: None,
+            utc,
+            reason: "fixture".into(),
+        });
+        for _ in 0..8 {
+            tx.try_send(row.clone()).unwrap();
+        }
+        {
+            let pending = state.send_rows(&tx, vec![row]);
+            tokio::pin!(pending);
+            assert!(tokio::time::timeout(Duration::from_secs(30), &mut pending)
+                .await
+                .is_err());
+            while rx.try_recv().is_ok() {}
+            pending.await.unwrap();
+        }
+        assert!(tx.capacity() > 0, "a later capacity check misses the stall");
+        assert!(state.storage_stalled);
+        assert!(state.coverage.iter().all(Option::is_none));
+        let recovered = state.coverage_start(at, utc);
+        assert!(recovered.start >= Instant::now());
+        let rows: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, StorageRecord::Coverage(c)
+            if c.end == utc + Duration::from_secs(10)))
+                .count(),
+            2
+        );
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Gap(g) if g.reason == "storage queue full")));
+    }
 
     fn test_kind() -> StreamKind {
         StreamKind {

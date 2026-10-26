@@ -126,7 +126,13 @@ SELECT if(
     AND countIf(status = 'unknown'
                 AND (provider = {provider:String} OR provider IS NULL)
                 AND interval_start >= {from_utc:DateTime64(9)}
-                AND interval_start < {to_utc:DateTime64(9)}) = 0,
+                AND interval_start < {to_utc:DateTime64(9)}) = 0
+    AND (SELECT count() FROM (
+        SELECT bucket FROM benchmark_dirty_minutes
+        WHERE region = {region:String} AND cloud_provider = {cloud_provider:String}
+          AND bucket < {to_utc:DateTime64(9)}
+          AND bucket + INTERVAL 1 MINUTE > {from_utc:DateTime64(9)}
+        GROUP BY bucket HAVING sum(expected) > sum(revision) OR sum(incomplete) > 0)) = 0,
     'healthy', 'unknown') AS full_range_coverage
 FROM benchmark_measurement_health
 WHERE region = {region:String}

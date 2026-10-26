@@ -135,9 +135,11 @@ CREATE TABLE benchmark_dirty_minutes
     region LowCardinality(String),
     cloud_provider LowCardinality(String),
     bucket DateTime('UTC'),
-    revision UInt64
+    revision UInt64 DEFAULT 0,
+    expected UInt64 DEFAULT 0,
+    incomplete UInt64 DEFAULT 0 -- sticky uncertainty recovered from the local journal
 )
-ENGINE = ReplacingMergeTree(revision)
+ENGINE = SummingMergeTree((revision, expected, incomplete))
 ORDER BY (region, cloud_provider, bucket)
 -- Markers must outlive the summaries they invalidate (30 days): if a marker expired
 -- first, a summary that could never be rebuilt would silently become valid again.
@@ -155,10 +157,13 @@ ENGINE = MergeTree
 ORDER BY (region, cloud_provider, bucket, generation)
 TTL bucket + INTERVAL 30 DAY DELETE;
 
--- Inserts invalidate affected minutes, including rows written after the minute ended.
+-- Revisions count inserted rows, so clock rollback cannot hide later inserts.
+-- The writer acknowledges an expected-row marker BEFORE inserting raw rows.
+-- expected > revision is durable evidence of incomplete ingestion, including
+-- after restart. Such minutes are excluded from summaries and healthy coverage.
 CREATE MATERIALIZED VIEW benchmark_dirty_minutes_mv TO benchmark_dirty_minutes AS
 SELECT region, cloud_provider, toStartOfMinute(event_utc) AS bucket,
-       toUInt64(toUnixTimestamp64Nano(now64(9))) AS revision
+       count() AS revision
 FROM benchmark_event_lags GROUP BY region, cloud_provider, bucket;
 
 -- +goose Down

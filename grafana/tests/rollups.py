@@ -14,6 +14,7 @@ import math
 import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 import urllib.error
@@ -47,8 +48,11 @@ class ClickHouse:
         request = urllib.request.Request(self.url + '/?' + urllib.parse.urlencode(args), sql.encode())
         auth = base64.b64encode((self.user + ':' + self.password).encode()).decode()
         request.add_header('Authorization', 'Basic ' + auth)
-        with urllib.request.urlopen(request, timeout=150) as response:
-            return response.read().decode()
+        try:
+            with urllib.request.urlopen(request, timeout=150) as response:
+                return response.read().decode()
+        except urllib.error.HTTPError as error:
+            raise AssertionError(error.read().decode()) from error
 
     def rows(self, sql, **params):
         return [json.loads(line) for line in self.query(sql + ' FORMAT JSONEachRow', **params).splitlines()]
@@ -93,12 +97,13 @@ def equal(left, right):
                 assert a[key] == b[key], (key, a, b)
 
 
-def publish_scope(region, cloud, shutdown=False):
-    subprocess.run(['cargo', 'test', '--quiet', '--lib', 'rollups::tests::publish_fixture',
-                    '--', '--ignored', '--exact'], cwd=ROOT, check=True, stdout=subprocess.DEVNULL,
-                   env={**os.environ, 'BENCH_CH_DATABASE':database,
+def publish_scope(region, cloud, shutdown=False, fixture_database=None):
+    result = subprocess.run(['cargo', 'test', '--quiet', '--lib', 'rollups::tests::publish_fixture',
+                    '--', '--ignored', '--exact'], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                   env={**os.environ, 'BENCH_CH_DATABASE':fixture_database or database,
                         'ROLLUP_TEST_REGION':region, 'ROLLUP_TEST_CLOUD':cloud,
-                        'ROLLUP_TEST_SHUTDOWN':'1' if shutdown else '0'})
+                        'ROLLUP_TEST_SHUTDOWN':'unclean' if shutdown == 'unclean' else '1' if shutdown else '0'})
+    assert result.returncode == 0, result.stdout
 
 
 def drain():
@@ -150,8 +155,19 @@ try:
     def insert(provider, lag, outcome='on_time', event='split', second=70):
         c.query(f"INSERT INTO benchmark_event_lags VALUES ('FRA2','example-cloud','tx-new','transaction','processed','{event}','{provider}','{at(second)}','{outcome}',{lag},100)")
     insert('A', 0)
+    insert('A', 0, event='revision-baseline')
     drain()  # Publish a sole arrival: not yet a win.
     insert('B', 5000000)  # Another insert completes the pair in an already published minute.
+    # Revisions are cumulative row counts. A one-row increment smaller than the
+    # published revision must still invalidate it, without consulting any clock.
+    revision = c.rows("SELECT sum(revision) revision FROM benchmark_dirty_minutes "
+                      "WHERE region='FRA2' AND bucket={bucket:DateTime}", bucket=at(60))[0]['revision']
+    committed_revision = c.rows("SELECT argMax(revision,generation) revision FROM benchmark_rollup_commits "
+                                "WHERE region='FRA2' AND bucket={bucket:DateTime}", bucket=at(60))[0]['revision']
+    assert revision == committed_revision + 1 and committed_revision > 1, (revision, committed_revision)
+    c.query('OPTIMIZE TABLE benchmark_dirty_minutes FINAL')
+    assert c.rows("SELECT sum(revision) revision FROM benchmark_dirty_minutes "
+                  "WHERE region='FRA2' AND bucket={bucket:DateTime}", bucket=at(60))[0]['revision'] == revision
     for key in ['providerWinSummary', 'pairDroppedRate']:
         equal(query(QUERIES[key]), query(EXACT[key]))  # Dirty minute falls back immediately.
     # Orphan generation simulates failure after rows were written, before publication.
@@ -222,6 +238,66 @@ try:
     publish_scope('shutdown', 'cloud', shutdown=True)
     assert len(c.rows("SELECT * FROM benchmark_rollup_commits WHERE region='shutdown'")) == 1
     assert not c.rows(PENDING, region='shutdown', cloud_provider='cloud', include_open=1, settle_ms=0, limit=60)
+
+    # Real Rust writer, real production types, and a rejected final insert. The
+    # acknowledged intent must survive shutdown/restart, hide old summaries AND
+    # raw fallback, and override earlier healthy evidence for the failed minute.
+    failed_database = database + '_failed_ingestion'
+    c.query('CREATE DATABASE ' + failed_database)
+    failed = ClickHouse()
+    failed.database = failed_database
+    journal_directory = tempfile.TemporaryDirectory(prefix='benchmark-write-journal-')
+    def write_failure(recover=False, intent=False):
+        subprocess.run(['cargo','test','--quiet','--lib','storage::tests::failed_final_batch_fixture',
+                        '--','--ignored','--exact'], cwd=ROOT, check=True,
+                       env={**os.environ,'BENCH_CH_DATABASE':failed_database,'BENCH_TEST_STATE_DIR':journal_directory.name,
+                            'BENCH_TEST_RECOVER':'1' if recover else '0', 'BENCH_TEST_FAIL_INTENT':'1' if intent else '0'})
+    try:
+        for sql in migration_ddl(r'benchmark_.*'):
+            failed.query(sql)
+        failed.query("ALTER TABLE benchmark_event_lags ADD CONSTRAINT reject_missed CHECK outcome != 'missed'")
+        write_failure()
+        minute = failed.rows("SELECT toString(bucket) bucket,sum(revision) revision,sum(expected) expected "
+                             "FROM benchmark_dirty_minutes GROUP BY bucket")[0]
+        assert (minute['revision'], minute['expected']) == (1,2), minute
+        assert failed.rows('SELECT count() n FROM benchmark_event_lags')[0]['n'] == 1
+        write_failure(recover=True)
+        assert failed.rows('SELECT sum(incomplete) n FROM benchmark_dirty_minutes')[0]['n'] == 1
+        for shutdown in ['unclean', False, True]:
+            publish_scope('us-east','example-cloud',shutdown=shutdown,fixture_database=failed_database)
+            assert failed.rows('SELECT count() n FROM benchmark_rollup_commits')[0]['n'] == 0
+        # Simulate a previously published generation: the new unmatched intent
+        # must exclude it even when the actual raw revision has not increased.
+        failed.query(BUILD,bucket=minute['bucket'],generation=1,region='us-east',cloud_provider='example-cloud')
+        failed.query("INSERT INTO benchmark_rollup_commits VALUES ('us-east','example-cloud', {bucket:DateTime},1,1)",bucket=minute['bucket'])
+        from_time = dt.datetime.strptime(minute['bucket'],'%Y-%m-%d %H:%M:%S').replace(tzinfo=dt.timezone.utc)
+        gate = (ROOT / 'sql/reports.sql').read_text().split('-- SHORT-RANGE COVERAGE GATE:')[1]
+        gate = 'SELECT if(' + gate.split('SELECT if(',1)[1].split(';')[0]
+        coverage = failed.rows(gate,region='us-east',cloud_provider='example-cloud',
+                               subscription_id='id-4',provider='b',from_utc=stamp(1,from_time),to_utc=stamp(5,from_time))
+        assert coverage == [{'full_range_coverage':'unknown'}], coverage
+        for key, seconds, interval in [('providerWinSummary',60,10),('providerWinSummary',7200,60),
+                                       ('providerMetricsTrend',60,10),('providerMetricsTrend',60,60),('overview',60,60)]:
+            rows = failed.rows(render(QUERIES[key],start=0,end=seconds,interval=interval,anchor=from_time,
+                                      region='us-east',cloud_provider='example-cloud',data_type='slot',
+                                      commitment='processed',subscription_id='id-4',provider_a='a',provider_b='b'))
+            assert rows == [], (key,rows)
+        # An intent itself can fail before the database knows which minute was
+        # lost. Recovery must still mark that minute unknown from the local file.
+        for table in ['benchmark_event_lags','benchmark_dirty_minutes','benchmark_rollup_commits',
+                      'benchmark_minute_rollups','benchmark_measurement_health']:
+            failed.query('TRUNCATE TABLE ' + table)
+        failed.query('ALTER TABLE benchmark_dirty_minutes ADD CONSTRAINT reject_intents CHECK expected=0')
+        write_failure(intent=True)
+        assert failed.rows('SELECT count() n FROM benchmark_dirty_minutes')[0]['n'] == 0
+        assert failed.rows('SELECT count() n FROM benchmark_event_lags')[0]['n'] == 0
+        write_failure(recover=True)
+        assert failed.rows('SELECT sum(incomplete) n FROM benchmark_dirty_minutes')[0]['n'] == 1
+        publish_scope('us-east','example-cloud',shutdown=True,fixture_database=failed_database)
+        assert failed.rows('SELECT count() n FROM benchmark_rollup_commits')[0]['n'] == 0
+    finally:
+        journal_directory.cleanup()
+        c.query('DROP DATABASE ' + failed_database)
     # A provider disconnected for the whole range has no summaries, only downtime:
     # the Overview must still list it, with blank metrics, next to a provider
     # without disconnects (zero downtime).
@@ -261,6 +337,6 @@ try:
           query(QUERIES['providerWinSummary'], start=0, seconds=120))
     equal(query(QUERIES['providerMetricsTrend'], start=30, seconds=90, interval=60),
           query(QUERIES['providerMetricsTrend'], start=0, seconds=120, interval=60))
-    print('Rollup integration passed: raw/summary routes, exact counters, reverse pairs, All/history/hidden providers, partial boundaries, split inserts, rows after the minute ends, retries, unpublished generations, generation cleanup, retained summaries, subscriber isolation, shutdown of an open minute, and Overview rows for providers that were down throughout.')
+    print('Rollup integration passed: raw/summary routes, exact counters, reverse pairs, All/history/hidden providers, partial boundaries, split inserts, cumulative revisions through merges, retries, unpublished generations, generation cleanup, retained summaries, subscriber isolation, shutdown of an open minute, rejected final inserts and intents with restart recovery, coverage gating, and Overview rows for providers that were down throughout.')
 finally:
     c.query('DROP DATABASE ' + database)

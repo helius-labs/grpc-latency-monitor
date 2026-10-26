@@ -72,7 +72,7 @@ const metrics: Array<[string, string, string, number, string, Steps | null]> = [
     '99th percentile on-time lag behind each event’s earliest provider arrival at that location. Lower is better; dropped events are excluded.',
     [[10, '#EAB839'], [20, '#FF9830'], [100, '#F2495C']]],
   ['dropped_percent', 'Dropped', 'percent', 2,
-    'Share of a connected provider’s events not delivered within 5 s of the first provider’s delivery.',
+    'Share of a connected provider’s events not delivered within the configured window after the first provider’s delivery.',
     [[0.1, '#EAB839'], [0.5, '#FF9830'], [1, '#F2495C']]],
   ['disconnected_seconds', 'Downtime', 's', 1,
     `Time each provider’s streams at that location could not reconnect: outages lasting at least ${OUTAGE_SECONDS} s, from a disconnect until the next successful subscription, summed over streams. A shorter interruption, such as a rolling restart that accepts the reconnect right away, counts only as a disconnect. Disconnects caused by the subscriber’s own backlog are excluded. A stalled stream counts only from the moment it is dropped for inactivity (30 s without traffic); events in the stall count as dropped.`,

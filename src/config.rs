@@ -7,6 +7,9 @@ use std::{collections::HashSet, path::Path, time::Duration};
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Persist this directory across restarts; it contains pending-write metadata.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: std::path::PathBuf,
     pub subscriber: SubscriberConfig,
     pub providers: Vec<ProviderConfig>,
     pub clickhouse: ClickHouseConfig,
@@ -49,6 +52,10 @@ pub struct Config {
     /// Removed setting, accepted only to explain the migration at startup.
     #[serde(default, rename = "late_period")]
     removed_late_period: Option<serde::de::IgnoredAny>,
+}
+
+fn default_state_dir() -> std::path::PathBuf {
+    ".benchmark-state".into()
 }
 
 fn default_expired_key_retention() -> Duration {

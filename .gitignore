@@ -1,4 +1,5 @@
 /target/
+/.benchmark-state/
 *.local.toml
 *.local.yaml
 *.local.yml

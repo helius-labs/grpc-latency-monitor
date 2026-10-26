@@ -29,7 +29,7 @@ for (const [name, color, query] of [
 
 const winDescription = 'Provider wins / selected-provider wins. A win is the first on-time delivery of an event that ≥2 connected providers competed for; dropping an event loses it. First-place ties excluded. All configured providers compete.';
 const downtimeDescription = `Downtime: time each provider’s selected streams could not reconnect, counting outages that lasted at least ${sql.OUTAGE_SECONDS} s from a disconnect until the next successful subscription, summed over streams. Disconnects: how often the streams were interrupted, including short reconnects (such as a rolling restart) that are not downtime. Disconnects caused by the subscriber’s own backlog (a full arrival or control queue) are excluded. Events while disconnected are excluded from comparisons rather than counted as dropped, so check downtime and disconnects alongside win and dropped rates.`;
-const lagDescription = 'On-time lag behind each event’s earliest configured-provider arrival (ms), within the 5 s window. Lower is better; dropped events are excluded and provider samples can differ.';
+const lagDescription = 'On-time lag behind each event’s earliest configured-provider arrival (ms), within the configured window. Lower is better; dropped events are excluded and provider samples can differ.';
 
 function comparison(id: number, title: string, query: string, x: number, unit: string, color: string, description: string, valueField = unit === 'percent' ? 'win_percent' : 'lag_ms') {
   return new BarGauge().id(id).title(title).description(description)
@@ -53,7 +53,7 @@ providersDashboard
     '**Resolution:** ten-second detail for the latest six hours; minute summaries for longer or older views. Overview percentiles are exact up to one hour and approximate for longer views. Counts and wins stay exact. Ranges older than six hours are widened to whole minutes at their edges (raw detail has expired). Summary, connection and health history retain 30 days.',
     'Bars summarize the selected time range. Graphs show each time bucket. Bars and trends use the selected region and cloud provider. **All** pools account, transaction and slot events, using the latest configuration per stream.',
     '**Ideal provider:** the first arrival for each event across all configured providers. The winner can change each event. Lag is the delay behind that arrival, in milliseconds. Hiding a provider does not change this baseline. Example: A arrives first, B follows 4 ms later → A = 0 ms, B = 4 ms. This measures local delivery differences, not time since the event was produced.',
-    '**Dropped = not delivered within 5 seconds.** Each event opens a 5 s window at the first provider’s delivery. A connected provider that has not delivered by then counts as **dropped** for that event, even if its delivery arrives later. Later deliveries are ignored; there is no “late” category.',
+    '**Dropped = not delivered within the configured window.** Each event opens the configured comparison window at the first provider’s delivery. A connected provider that has not delivered by then counts as **dropped** for that event, even if its delivery arrives later. Later deliveries are ignored; there is no “late” category.',
     '**Percentiles:** lower is better. **p50 = 4 ms** means roughly half of a provider’s on-time deliveries lagged the ideal by 4 ms or less. **p99 = 20 ms** means roughly 99% lagged by 20 ms or less. p95 and p99.9 follow the same rule. Dropped events are excluded, so read percentiles together with the dropped rate.',
     '**Comparing providers:** percentile samples can differ. Subtracting two p50 values does not tell you the median difference on shared events. Use **Head to Head** for that comparison.',
     '**Win rate:** provider wins ÷ combined wins of selected providers. A win is the first on-time delivery of an event that at least two connected providers competed for; a provider that **drops** an event loses it to every provider that delivered it. First-place ties are excluded. Example: A wins 60 times and B wins 40 → 60% and 40%. Hidden providers still compete. Shares sum to 100%; no selected wins means no data.',
@@ -80,9 +80,9 @@ providersDashboard
   .withPanel(trend(5, 'Observed on-time events per second', null, 0, 27, 'ops')
     .gridPos({ x: 0, y: 27, w: 8, h: 8 })
     .displayName('${__field.labels.provider}'))
-  .withPanel(trend(6, 'Dropped events per second (not delivered within 5 s)', null, 16, 27, 'ops')
+  .withPanel(trend(6, 'Dropped events per second (not delivered within the configured window)', null, 16, 27, 'ops')
     .gridPos({ x: 16, y: 27, w: 8, h: 8 }).axisSoftMin(0)
-    .description('Events a connected provider did not deliver within 5 s of the first provider’s delivery, per second. Deliveries after 5 s still count as dropped. Raw, deduplicated observations; gaps mean no observations.')
+    .description('Events a connected provider did not deliver within the configured window after the first provider’s delivery, per second. Deliveries after that window still count as dropped. Raw, deduplicated observations; gaps mean no observations.')
     .displayName('${__field.labels.provider}'))
   .withPanel(trend(10, 'On-time message throughput — ${data_type} / ${commitment}', null, 8, 27, 'Bps')
     .gridPos({ x: 8, y: 27, w: 8, h: 8 })

@@ -140,16 +140,16 @@ impl Worker {
 
     /// Errors retry independently of the measurement path. Shutdown is signaled
     /// only after the storage writer flushes, then includes the final open minute.
-    pub async fn run(self, mut shutdown: oneshot::Receiver<()>) -> Result<()> {
+    pub async fn run(self, mut shutdown: oneshot::Receiver<bool>) -> Result<()> {
         info!(
             region = self.region,
             cloud_provider = self.cloud_provider,
             "Subscriber rollups started"
         );
         let mut last_cleanup: Option<tokio::time::Instant> = None;
-        loop {
+        let clean_shutdown = loop {
             tokio::select! {
-                _ = &mut shutdown => break,
+                result = &mut shutdown => break result.unwrap_or(false),
                 result = self.drain(false) => {
                     if let Err(error) = result {
                         error!(error = %format!("{error:#}"), "Rollup failed; will retry");
@@ -159,7 +159,7 @@ impl Worker {
             if last_cleanup.is_none_or(|at| at.elapsed() >= CLEANUP_INTERVAL) {
                 last_cleanup = Some(tokio::time::Instant::now());
                 tokio::select! {
-                    _ = &mut shutdown => break,
+                    result = &mut shutdown => break result.unwrap_or(false),
                     result = self.cleanup(SystemTime::now()) => {
                         if let Err(error) = result {
                             error!(error = %format!("{error:#}"), "Summary cleanup failed; will retry");
@@ -168,9 +168,13 @@ impl Worker {
                 }
             }
             tokio::select! {
-                _ = &mut shutdown => break,
+                result = &mut shutdown => break result.unwrap_or(false),
                 _ = tokio::time::sleep(Duration::from_secs(10)) => {}
             }
+        };
+        if !clean_shutdown {
+            info!("Skipping final rollup flush after unclean ingestion shutdown");
+            return Ok(());
         }
         tokio::time::timeout(Duration::from_secs(150), self.drain(true))
             .await
@@ -288,9 +292,10 @@ mod tests {
             .with_user(std::env::var("BENCH_CH_USER")?)
             .with_password(std::env::var("BENCH_CH_PASSWORD")?);
         let worker = Worker::new(client, &key, &region, &cloud, Duration::ZERO).await?;
-        if std::env::var("ROLLUP_TEST_SHUTDOWN").as_deref() == Ok("1") {
+        let shutdown = std::env::var("ROLLUP_TEST_SHUTDOWN").unwrap_or_default();
+        if shutdown == "1" || shutdown == "unclean" {
             let (send, receive) = oneshot::channel();
-            send.send(()).unwrap();
+            send.send(shutdown == "1").unwrap();
             worker.run(receive).await
         } else {
             worker.drain(true).await

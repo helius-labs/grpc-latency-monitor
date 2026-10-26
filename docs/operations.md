@@ -36,12 +36,14 @@ The benchmark loads `.env` from the current working directory before reading con
 
 Set `clickhouse.url` to the external ClickHouse HTTP(S) endpoint (typically port 8123, not the native port 9000). Create the database and apply the [Goose migrations](../sql/README.md) with a separate migration user. The application user needs:
 
-- INSERT and DESCRIBE on the five ingestion/metadata tables,
+- INSERT and DESCRIBE on the five ingestion/metadata tables and `benchmark_dirty_minutes`,
 - SELECT on event lags, dirty minutes and rollup commits,
 - INSERT on minute rollups and rollup commits,
 - ALTER DELETE on minute rollups (to delete superseded summary generations).
 
 Retention is managed in the SQL migrations: six hours of raw measurements and 30 days of minute summaries and connection/health history. Each subscriber builds its own [minute summaries](../sql/README.md#hybrid-dashboard-summaries) in the background; no separate rollup service is needed.
+
+`state_dir` defaults to `.benchmark-state` in the working directory. Keep it on persistent storage and mount it into subscriber containers. It stores only pending minute IDs, under filenames hashed from database and subscriber identity. The writer syncs this recovery metadata before attempting raw inserts and clears it after all batch inserts are acknowledged. Startup marks any remaining minutes unknown in ClickHouse before starting rollups or provider subscriptions; if recovery fails, startup stops. Preserve the directory when restarting or moving the subscriber.
 
 ## Running
 
@@ -49,7 +51,9 @@ Retention is managed in the SQL migrations: six hours of raw measurements and 30
 cargo run --release -- --config your.local.yaml
 ```
 
-Startup checks, using the Rust row structs, that every table and column exists and is insertable before opening provider streams.
+Startup checks, using the Rust row structs, that the written columns exist and are insertable before opening provider streams. This metadata check does not test INSERT privileges; see [Startup validation](../sql/README.md#startup-validation).
+
+Allow at least 60 seconds for matchers to drain, the writer's remaining insert timeouts, and 150 seconds for final rollups when setting termination grace. A matcher timeout or failed writer produces an unsuccessful exit; only a clean ingestion shutdown publishes the final open minute. Alert on unmatched expected-row counts or a positive `incomplete` count in `benchmark_dirty_minutes`: affected minutes stay unknown after restart and require investigation, not blind insert retries.
 
 ## Tuning and connection behavior
 

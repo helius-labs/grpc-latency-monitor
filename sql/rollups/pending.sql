@@ -1,10 +1,10 @@
 -- Leave one hour of safety before raw TTL can remove rows during a rebuild.
 SELECT toString(d.bucket) AS bucket, d.revision AS revision, ifNull(c.generation, 0) AS generation
-FROM (SELECT bucket, max(revision) AS revision FROM benchmark_dirty_minutes
+FROM (SELECT bucket, sum(revision) AS revision FROM benchmark_dirty_minutes
  WHERE region = {region:String} AND cloud_provider = {cloud_provider:String}
  AND bucket < toStartOfMinute(now() - toIntervalMillisecond({settle_ms:UInt64})) + toIntervalMinute({include_open:UInt8})
  AND bucket >= now() - INTERVAL 5 HOUR
- GROUP BY bucket) d
+ GROUP BY bucket HAVING revision >= sum(expected) AND sum(incomplete) = 0) d
 LEFT JOIN (SELECT bucket, max(commits.generation) AS generation,
  argMax(commits.revision, commits.generation) AS revision
  FROM benchmark_rollup_commits AS commits

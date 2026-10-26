@@ -32,7 +32,34 @@ fn client(config: &Config) -> Result<clickhouse::Client> {
 }
 
 /// How long matchers get to write their pending rows on shutdown.
-const MATCHER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const MATCHER_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn drain_matchers(
+    matchers: &mut tokio::task::JoinSet<Result<()>>,
+    timeout: Duration,
+) -> Result<()> {
+    let result = tokio::time::timeout(timeout, async {
+        let mut failure = None;
+        while let Some(result) = matchers.join_next().await {
+            let result = result
+                .context("stream task panicked or was cancelled")
+                .and_then(|r| r);
+            if let Err(error) = result {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            matchers.abort_all();
+            while matchers.join_next().await.is_some() {}
+            bail!("stream tasks did not stop in time; pending rows lost; coverage unknown")
+        }
+    }
+}
 
 /// Worker threads for matching, the ClickHouse writer and summaries. None of them is
 /// latency critical: they only consume timestamps that readers already took.
@@ -76,13 +103,14 @@ fn main() -> Result<()> {
 async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
     let client = client(&config)?;
     storage::validate_schema(&client).await?;
+    let database_key = format!(
+        "{}/{}",
+        config.clickhouse.url.trim_end_matches('/'),
+        config.clickhouse.database
+    );
     let rollups = Worker::new(
         client.clone(),
-        &format!(
-            "{}/{}",
-            config.clickhouse.url.trim_end_matches('/'),
-            config.clickhouse.database
-        ),
+        &database_key,
         &config.subscriber.region,
         &config.subscriber.cloud_provider,
         rollups::settle_delay(
@@ -92,6 +120,16 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
         ),
     )
     .await?;
+    let mut journal = storage::WriteJournal::open(
+        &config.state_dir,
+        &[
+            &database_key,
+            &config.subscriber.region,
+            &config.subscriber.cloud_provider,
+        ],
+    )
+    .await?;
+    journal.recover(&client, &config.subscriber).await?;
     storage::register_subscriber(&client, &config.subscriber).await?;
     let (rollup_shutdown, rollup_stop) = tokio::sync::oneshot::channel();
     let mut rollup_task = tokio::spawn(rollups.run(rollup_stop));
@@ -106,6 +144,7 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
     let (storage_tx, storage_rx) = mpsc::channel(config.storage_buffer_capacity);
     let mut writer = tokio::spawn(storage::write(
         client,
+        journal,
         config.subscriber.cloud_provider.clone(),
         config.subscriber.region.clone(),
         config.providers.iter().map(|p| p.name.clone()).collect(),
@@ -156,7 +195,7 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
         }
     }
     drop(storage_tx);
-    let failure = tokio::select! {
+    let mut failure = tokio::select! {
         result = shutdown() => {
             tracing::info!("shutdown requested");
             result.err()
@@ -184,22 +223,9 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
     // then exits; no further interval is certified. Dropping their storage senders
     // lets the writer flush every accepted record, on failure too.
     let _ = stop_matchers.send(true);
-    let stopped = tokio::time::timeout(MATCHER_STOP_TIMEOUT, async {
-        while let Some(result) = matchers.join_next().await {
-            match result {
-                Ok(Err(error)) => tracing::warn!("stream task stopped: {error:#}"),
-                Err(error) if !error.is_cancelled() => {
-                    tracing::warn!("stream task panicked: {error}");
-                }
-                _ => {}
-            }
-        }
-    })
-    .await;
-    if stopped.is_err() {
-        tracing::warn!("stream tasks did not stop in time; their pending rows are lost");
-        matchers.abort_all();
-        while matchers.join_next().await.is_some() {}
+    if let Err(error) = drain_matchers(&mut matchers, MATCHER_STOP_TIMEOUT).await {
+        tracing::error!("{error:#}");
+        failure.get_or_insert(error);
     }
     stream_readers.abort_all();
     while stream_readers.join_next().await.is_some() {}
@@ -215,7 +241,7 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
     let summarized = if rollup_task_done {
         Ok(())
     } else {
-        let _ = rollup_shutdown.send(());
+        let _ = rollup_shutdown.send(failure.is_none() && written.is_ok());
         rollup_task.await.context("rollup task panicked")?
     };
     match failure {
@@ -233,4 +259,46 @@ async fn shutdown() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_a_slow_storage_drain() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(()).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { tx.send(()).await.context("writer stopped") });
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            rx.recv().await;
+            rx.recv().await;
+        });
+        drain_matchers(&mut tasks, MATCHER_STOP_TIMEOUT)
+            .await
+            .unwrap();
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_lost_pending_rows() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(std::future::pending::<Result<()>>());
+        let error = drain_matchers(&mut tasks, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("pending rows lost"));
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_propagates_matcher_failure() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { bail!("failed to persist coverage") });
+        assert!(drain_matchers(&mut tasks, MATCHER_STOP_TIMEOUT)
+            .await
+            .is_err());
+    }
 }

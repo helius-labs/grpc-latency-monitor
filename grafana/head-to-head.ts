@@ -23,7 +23,7 @@ headToHeadDashboard
   .withPanel(note([
     '**Resolution:** ten-second detail for the latest six hours; minute summaries for longer or older views. Overview percentiles are exact up to one hour and approximate for longer views. Counts and wins stay exact. Ranges older than six hours are widened to whole minutes at their edges (raw detail has expired). Summary, connection and health history retain 30 days.',
     'Compare **${provider_a} (A)** and **${provider_b} (B)** for the same region, cloud provider and subscription. We compare **the same event delivered on time by both providers**. **All** pools account, transaction and slot events, using the latest configuration per stream.',
-    '**Dropped = not delivered within 5 seconds.** Each event opens a 5 s window at the first provider’s delivery. A connected provider that has not delivered by then counts as **dropped** for that event, even if its delivery arrives later. Dropped events are not part of the differences, but they count in win rates: delivering an event the other provider dropped is a win.',
+    '**Dropped = not delivered within the configured window.** Each event opens the configured comparison window at the first provider’s delivery. A connected provider that has not delivered by then counts as **dropped** for that event, even if its delivery arrives later. Dropped events are not part of the differences, but they count in win rates: delivering an event the other provider dropped is a win.',
     `**Downtime:** events while a provider is disconnected are excluded from the comparison, not counted as dropped. The **downtime** cards show outages of at least ${sql.OUTAGE_SECONDS} s, when reconnecting kept failing; quicker reconnects are not downtime.`,
     'The difference is **${provider_a} arrival time − ${provider_b} arrival time**, in milliseconds. **Negative** means ${provider_a} arrived earlier; **positive** means ${provider_b} arrived earlier.',
     'Sort these signed differences from smallest to largest: **p5** is the 5th percentile, **p50** is the median (half the differences are below it, half above), and **p95** is the 95th percentile. **p0.1** is the 0.1st percentile. These describe arrival differences, not a provider’s win rate.',
@@ -45,10 +45,10 @@ headToHeadDashboard
     .description('Provider wins / (${provider_a} wins + ${provider_b} wins), per bucket. A win is the faster on-time delivery, or delivering an event the other provider dropped. Ties excluded; dashed line = 50%.')
     .overrideByName('a_win_percent', [{ id: 'displayName', value: '${provider_a}' }])
     .overrideByName('b_win_percent', [{ id: 'displayName', value: '${provider_b}' }]))
-  .withPanel(trend(6, 'Dropped events per second (not delivered within 5 s)', sql.pairDroppedRate, 12, 22, 'ops')
+  .withPanel(trend(6, 'Dropped events per second (not delivered within the configured window)', sql.pairDroppedRate, 12, 22, 'ops')
     .gridPos({ x: 12, y: 22, w: 12, h: 8 })
     .axisSoftMin(0)
-    .description('Events each provider did not deliver within 5 s of the first provider’s delivery while connected, per second, including unpaired events. Deliveries after 5 s still count as dropped. Gaps mean no observations.')
+    .description('Events each provider did not deliver within the configured window after the first provider’s delivery while connected, per second, including unpaired events. Deliveries after that window still count as dropped. Gaps mean no observations.')
     .displayName('${__field.labels.series}'));
 
 const cards = [

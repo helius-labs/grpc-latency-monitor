@@ -5,11 +5,13 @@ Three dashboards are defined with the **Grafana Foundation SDK**, sharing builde
 **Definitions used across dashboards:**
 
 - **Ideal provider:** the first observed arrival for each event across all configured providers. Lag is milliseconds behind it, not chain-to-client latency.
+- **Dropped:** not delivered within the configured comparison window after the first provider's delivery. The example window is five seconds; the selected configuration's label shows its actual window.
 - **Win:** the first on-time delivery of an event that at least two connected providers competed for. A provider that drops an event loses it to every provider that delivered it. First-place ties and uncontested deliveries are excluded; win shares divide wins by the selected providers' combined wins.
 - **Downtime:** outages only, i.e. disconnected periods of at least 10 seconds in which reconnecting kept failing, counted in full. The threshold is `OUTAGE_SECONDS` in [`grafana/queries.ts`](../grafana/queries.ts). Events while a provider is disconnected are excluded from its comparisons rather than counted as dropped.
 - **Disconnects:** every interruption, including quick reconnects such as a rolling restart behind one endpoint.
 - Disconnects caused by the subscriber's own backlog (`arrival queue full`, `control queue full`) are not provider downtime and are excluded.
 - Dropped counts are raw observations. An empty dropped plot means no matching rows in the selected range, not certified zero loss.
+- Minutes with unmatched raw-write counts are unknown and excluded from event metrics on both the summary and raw paths, including after a subscriber restart. Connection reporting remains available.
 
 ## All Providers
 

@@ -5,7 +5,7 @@
 // on every refresh from the time range and bucket size; `exactQueries` exposes the
 // exact forms so the SQL tests can check that both agree.
 import { dataTypeScope, subscriptionScope as scope } from './subscriptions.js';
-import { activity, states, withRollups } from './rollups.js';
+import { activity, completeRawMinutes, states, withRollups } from './rollups.js';
 
 const displayProviders = '$__conditionalAll(provider IN (${provider:sqlstring}), $provider)';
 const pairProviders = 'provider IN (${provider_a:sqlstring}, ${provider_b:sqlstring})';
@@ -22,6 +22,7 @@ function perEvent(filter: string, providers: string | null = displayProviders): 
  minIf(assumeNotNull(lag_ns), outcome = 'on_time') AS lag_ns
  FROM benchmark_event_lags WHERE ${filter}
 AND $__timeFilter_ms(event_utc)
+AND ${completeRawMinutes}
 AND outcome IN ('on_time', 'missed')
 ${providers === null ? '' : `AND ${providers}`}
  GROUP BY region, cloud_provider, subscription_id, data_type, commitment, event_id, provider
@@ -41,6 +42,7 @@ const providerWins = `WITH event_winners AS (
  minIf(provider, outcome = 'on_time' AND lag_ns = 0) AS winner,
  groupUniqArrayIf(provider, outcome IN ('on_time', 'missed')) AS providers
  FROM benchmark_event_lags WHERE ${scope} AND $__timeFilter_ms(event_utc)
+ AND ${completeRawMinutes}
  GROUP BY subscription_id, data_type, commitment, event_id
 ), selected_events AS (
  SELECT provider, winner_utc AS event_utc, eligible AND provider = winner AS is_win
@@ -66,6 +68,7 @@ const pairs = `WITH pairs AS (
  (both_on_time AND difference_ns < 0) OR (a_on_time AND NOT b_on_time) AS a_win,
  (both_on_time AND difference_ns > 0) OR (b_on_time AND NOT a_on_time) AS b_win
  FROM benchmark_event_lags WHERE ${scope} AND $__timeFilter_ms(event_utc)
+ AND ${completeRawMinutes}
  AND outcome IN ('on_time', 'missed') AND provider IN (\${provider_a:sqlstring}, \${provider_b:sqlstring})
  GROUP BY subscription_id, data_type, commitment, event_id
  HAVING countIf(provider = \${provider_a:sqlstring}) > 0

@@ -13,9 +13,10 @@ const manifest = `SELECT c.region, c.cloud_provider, c.bucket, c.generation FROM
  (SELECT region, cloud_provider, bucket, max(commits.generation) generation, argMax(commits.revision, commits.generation) revision
   FROM benchmark_rollup_commits AS commits
   WHERE ${eligibleBucket} GROUP BY region, cloud_provider, bucket) c
- LEFT JOIN (SELECT region, cloud_provider, bucket, max(revision) revision FROM benchmark_dirty_minutes
+ LEFT JOIN (SELECT region, cloud_provider, bucket, sum(revision) revision, sum(expected) expected, sum(incomplete) incomplete FROM benchmark_dirty_minutes
   WHERE ${eligibleBucket} GROUP BY region, cloud_provider, bucket) d
- ON c.region = d.region AND c.cloud_provider = d.cloud_provider AND c.bucket = d.bucket WHERE c.revision >= d.revision`;
+ ON c.region = d.region AND c.cloud_provider = d.cloud_provider AND c.bucket = d.bucket
+ WHERE c.revision >= d.revision AND d.revision >= d.expected AND d.incomplete = 0`;
 export function withRollups(sql: string): string {
   return `WITH (SELECT groupArray(tuple(region, cloud_provider, bucket, generation)) FROM (${manifest})) AS rollup_generations
  SELECT * FROM (${sql})`;
@@ -27,6 +28,12 @@ const committedBuckets = `SELECT tupleElement(r, 1), tupleElement(r, 2), tupleEl
 // Bound the fallback grid to raw retention, even for a month-long dashboard.
 const rawStart = "toUInt32(toStartOfMinute(greatest($__fromTime_ms, now() - INTERVAL 6 HOUR)))";
 const rawEnd = 'toUInt32(toStartOfMinute($__toTime_ms)) + 60';
+const incompleteMinutes = `SELECT region, cloud_provider, bucket FROM benchmark_dirty_minutes
+ WHERE bucket >= toStartOfMinute($__fromTime_ms) AND bucket <= toStartOfMinute($__toTime_ms)
+ GROUP BY region, cloud_provider, bucket HAVING sum(expected) > sum(revision) OR sum(incomplete) > 0`;
+// Apply to exact raw queries as well as summary fallback. An acknowledged intent
+// with missing raw rows must not turn an incomplete minute into event metrics.
+export const completeRawMinutes = `(region, cloud_provider, toStartOfMinute(event_utc)) NOT IN (${incompleteMinutes})`;
 // Build a positive set of uncommitted subscriber/minute keys. A plain NOT IN
 // over raw rows would scan already summarized history before discarding it.
 export const rawMinutes = `(region, cloud_provider, toStartOfMinute(event_utc)) IN (
@@ -36,7 +43,8 @@ export const rawMinutes = `(region, cloud_provider, toStartOfMinute(event_utc)) 
        UNION DISTINCT SELECT tupleElement(r, 1), tupleElement(r, 2)
        FROM (SELECT arrayJoin(rollup_generations) AS r))
  ARRAY JOIN range(${rawStart}, greatest(${rawStart}, ${rawEnd}), 60) AS second
- WHERE (region, cloud_provider, bucket) NOT IN (${committedBuckets}))`;
+ WHERE (region, cloud_provider, bucket) NOT IN (${committedBuckets})
+ AND (region, cloud_provider, bucket) NOT IN (${incompleteMinutes}))`;
 
 // The subscriber's rollup worker builds summaries from the same template, so the
 // raw fallback counts events exactly like the summaries it stands in for.

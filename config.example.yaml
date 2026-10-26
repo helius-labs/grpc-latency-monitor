@@ -1,3 +1,6 @@
+# Keep pending-write minute IDs on persistent storage across restarts. Containers
+# must mount this directory. It stores recovery metadata, not measurement rows.
+state_dir: ".benchmark-state"
 # Maximum results per ClickHouse insert; inserts also flush at flush_interval, which
 # bounds latency. Large batches keep inserts (and new parts) to about one per second.
 batch_size: 50000
@@ -30,7 +33,7 @@ expired_key_retention: "2m"
 # "0s" disables it.
 connection_warmup: "1s"
 # A processed account or transaction miss waits until its slot is confirmed (then it
-# counts as dropped) or dead or passed by a finalized slot (then it is recorded as
+# counts as dropped) or explicitly dead (then it is recorded as
 # forked: the event was on a fork the provider never replayed, not a drop). Misses
 # still undecided after this long count as forked. Optional; defaults to 30s.
 slot_confirmation_timeout: "30s"

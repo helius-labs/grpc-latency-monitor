@@ -24,16 +24,12 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
 };
 
-/// Include gRPC status messages; keep other transport error text omitted.
+/// Log only error classifications: server-supplied messages can echo credentials.
 fn connection_error_detail(error: &(dyn std::error::Error + 'static)) -> String {
     let mut current = Some(error);
     while let Some(error) = current {
         if let Some(status) = error.downcast_ref::<yellowstone_grpc_proto::tonic::Status>() {
-            return format!(
-                "gRPC status: {:?}, message: {}",
-                status.code(),
-                status.message()
-            );
+            return format!("gRPC status: {:?}", status.code());
         }
         if let Some(error) = error.downcast_ref::<std::io::Error>() {
             return format!("I/O error: {:?}", error.kind());
@@ -351,7 +347,7 @@ fn control_event(
     }
 }
 
-/// Deliver a disconnect or gap, waiting for room: no dropped lifecycle signal is
+/// Deliver a disconnect, waiting for room: no dropped lifecycle signal is
 /// safe, and the reader is not reading updates meanwhile. While it waits, its
 /// stamp stays published, so the matcher treats it as stalled (open comparisons
 /// invalidated, health withheld) until the signal is queued. Returns false only
@@ -369,6 +365,27 @@ async fn control(
     let sent = tx.send(event).await.is_ok();
     drop(stamp);
     sent
+}
+
+/// The caller holds the update's published stamp until this gap is enqueued.
+/// Preserve both original clocks even if decoding or enqueueing was delayed.
+async fn send_gap(
+    tx: &mpsc::Sender<StreamControl>,
+    provider: usize,
+    stream: StreamKind,
+    at: Instant,
+    utc: SystemTime,
+    reason: &'static str,
+) -> bool {
+    tx.send(StreamControl::Gap {
+        provider,
+        stream,
+        at,
+        utc,
+        reason: reason.into(),
+    })
+    .await
+    .is_ok()
 }
 
 /// Announce a new subscription without waiting. Waiting would leave its updates
@@ -654,15 +671,8 @@ async fn read_connection(
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Closed(_)) => return None,
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        if !control(
-                            controls,
-                            provider_index,
-                            kind,
-                            "gap",
-                            ARRIVAL_QUEUE_FULL,
-                            in_flight,
-                        )
-                        .await
+                        if !send_gap(controls, provider_index, kind, at, utc, ARRIVAL_QUEUE_FULL)
+                            .await
                         {
                             return None;
                         }
@@ -672,13 +682,13 @@ async fn read_connection(
             }
             Ok(None) => {}
             Err(_) => {
-                if !control(
+                if !send_gap(
                     controls,
                     provider_index,
                     kind,
-                    "gap",
+                    at,
+                    utc,
                     "invalid stream update",
-                    in_flight,
                 )
                 .await
                 {
@@ -696,7 +706,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn connection_diagnostics_include_grpc_messages_and_classify_other_causes() {
+    fn connection_diagnostics_never_include_server_messages_or_credentials() {
         let secret = "https://provider.invalid/private-token?api-key=secret";
         let error = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, secret);
         assert_eq!(
@@ -710,20 +720,14 @@ mod tests {
             "I/O error: TimedOut"
         );
         for (code, message) in [
-            (
-                yellowstone_grpc_proto::tonic::Code::DataLoss,
-                "stream data lost",
-            ),
-            (
-                yellowstone_grpc_proto::tonic::Code::Internal,
-                "upstream failure",
-            ),
+            (yellowstone_grpc_proto::tonic::Code::DataLoss, secret),
+            (yellowstone_grpc_proto::tonic::Code::Internal, secret),
         ] {
             let status = yellowstone_grpc_proto::tonic::Status::new(code, message);
             let wrapper = anyhow::Error::new(status).context("stream failed");
             assert_eq!(
                 connection_error_detail(wrapper.as_ref()),
-                format!("gRPC status: {code:?}, message: {message}")
+                format!("gRPC status: {code:?}")
             );
         }
         let error = anyhow::anyhow!("unexpected failure: {secret}");
@@ -764,7 +768,10 @@ mod tests {
         ));
         // A gap waits for room, keeping its stamp published so the matcher
         // treats the reader as stalled meanwhile.
-        let gap = control(&controls_tx, 0, kind, "gap", ARRIVAL_QUEUE_FULL, &in_flight);
+        let stamp = in_flight.stamp(0);
+        let at = stamp.at();
+        let utc = SystemTime::now();
+        let gap = send_gap(&controls_tx, 0, kind, at, utc, ARRIVAL_QUEUE_FULL);
         tokio::pin!(gap);
         assert!(tokio::time::timeout(Duration::from_millis(50), &mut gap)
             .await
@@ -775,10 +782,12 @@ mod tests {
             Some(StreamControl::Connected { .. })
         ));
         assert!(gap.await);
+        drop(stamp);
         assert!(!in_flight.published_before(Instant::now() + Duration::from_secs(1)));
         assert!(matches!(
             controls_rx.recv().await,
-            Some(StreamControl::Gap { .. })
+            Some(StreamControl::Gap { at: received_at, utc: received_utc, .. })
+                if received_at == at && received_utc == utc
         ));
         // Only a stopped matcher stops the reader.
         drop(controls_rx);
@@ -787,6 +796,55 @@ mod tests {
             announce_connected(&controls_tx, 0, kind, &in_flight),
             Err(mpsc::error::TrySendError::Closed(_))
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_gap_invalidates_the_dropped_updates_original_window() {
+        use crate::matcher::Matcher;
+        let kind = kind(DataType::Transaction, Commitment::Finalized);
+        let start = Instant::now();
+        let utc = SystemTime::now();
+        let mut matcher = Matcher::new(
+            kind,
+            2,
+            Duration::from_secs(5),
+            Duration::ZERO,
+            100,
+            Duration::from_secs(120),
+            100,
+        );
+        for provider in 0..2 {
+            matcher.connection_change(provider, start, utc, true, "subscribed");
+        }
+        matcher.arrival(Arrival {
+            provider: 0,
+            message_bytes: None,
+            key: EventKey::Transaction {
+                slot: 100,
+                signature: vec![1; 64],
+            },
+            at: start,
+            utc,
+        });
+        let in_flight = InFlight::new(2);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let stamp = in_flight.stamp(1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        assert!(send_gap(&tx, 1, kind, stamp.at(), utc, ARRIVAL_QUEUE_FULL).await);
+        drop(stamp);
+        let StreamControl::Gap {
+            at, utc, reason, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("gap expected")
+        };
+        matcher.gap(Some(1), at, utc, reason);
+        assert!(!in_flight.published_before(Instant::now()));
+        assert!(
+            matcher.close(Instant::now()).is_empty(),
+            "lost on-time input must not produce a drop or win"
+        );
     }
 
     #[test]
