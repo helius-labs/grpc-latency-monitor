@@ -1,0 +1,32 @@
+[package]
+name = "solana-streaming-benchmark"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+description = "Regional Yellowstone gRPC provider comparison benchmark"
+repository = "https://github.com/solana-foundation/grpc-latency-monitor"
+readme = "README.md"
+publish = false
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+bs58 = "0.5"
+clap = { version = "4", features = ["derive"] }
+clickhouse = { version = "0.15", features = ["rustls-tls", "time"] }
+dotenvy = "0.15"
+futures = "0.3"
+humantime-serde = "1"
+prost = "0.14"
+serde = { version = "1", features = ["derive"] }
+yaml_serde = "0.10"
+time = { version = "0.3", features = ["serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+yellowstone-grpc-client = "=14.0.1"
+yellowstone-grpc-proto = "=13.0.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

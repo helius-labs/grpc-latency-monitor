@@ -1,0 +1,1066 @@
+//! Matching for one stream: arrivals and connection changes in, comparison rows
+//! and certified coverage out. Readers only stamp and enqueue; everything that
+//! decides a result happens here.
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
+use anyhow::{Context, Result};
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
+
+use crate::{
+    config::Config,
+    forks::{ForkFilter, SlotFates},
+    matcher::Matcher,
+    model::{Arrival, Commitment, CoverageRecord, DataType, EventKey, StorageRecord, StreamKind},
+    stream::{InFlight, StreamControl},
+};
+
+/// How often healthy coverage is written per provider and stream. Pending
+/// certified time is flushed as soon as health is lost, so batching never drops
+/// certified time; it only bounds the health table to about one row per minute.
+pub const COVERAGE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Certified-healthy time for one provider that has not been written yet.
+/// Consecutive rows overlap by one comparison window; do not sum their durations.
+#[derive(Clone, Copy)]
+struct Coverage {
+    start: Instant,
+    start_utc: SystemTime,
+    /// UTC end of the latest clean tick, if not yet written.
+    certified: Option<SystemTime>,
+}
+
+/// Matcher state for one stream, plus the health bookkeeping that depends on it.
+struct StreamState {
+    kind: StreamKind,
+    matcher: Matcher,
+    coverage: Vec<Option<Coverage>>,
+    connected: Vec<bool>,
+    connection_warmup: Duration,
+    /// A stale arrival invalidates open comparisons at most once per tick:
+    /// repeating the full scan per arrival would make a backlog quadratic.
+    stale_invalidated: bool,
+    /// Slot streams record slot statuses; processed account and transaction
+    /// streams hold their misses until the slot's fate is known.
+    fates: Arc<SlotFates>,
+    forks: Option<ForkFilter>,
+}
+
+impl StreamState {
+    fn new(kind: StreamKind, count: usize, config: &Config, fates: Arc<SlotFates>) -> Self {
+        let forks = (kind.commitment == Commitment::Processed && kind.data_type != DataType::Slot)
+            .then(|| {
+                ForkFilter::new(
+                    config.slot_confirmation_timeout,
+                    config.expired_key_capacity(),
+                )
+            });
+        Self {
+            kind,
+            matcher: Matcher::new(
+                kind,
+                count,
+                config.window,
+                config.connection_warmup,
+                config.matcher_key_capacity,
+                config.expired_key_retention,
+                config.expired_key_capacity(),
+            ),
+            coverage: vec![None; count],
+            connected: vec![false; count],
+            connection_warmup: config.connection_warmup,
+            stale_invalidated: false,
+            fates,
+            forks,
+        }
+    }
+
+    /// On shutdown, write certified time still pending and undecided misses (as
+    /// forked). Open windows are not written: no coverage interval contains them.
+    fn stop(&mut self) -> Vec<StorageRecord> {
+        let mut rows = self.lose_health(None);
+        if let Some(forks) = &mut self.forks {
+            rows.extend(forks.drain());
+        }
+        rows
+    }
+
+    /// Close windows whose deadline has passed and release misses whose slot
+    /// fate is now known.
+    fn close(&mut self, end: Instant, now: Instant) -> Vec<StorageRecord> {
+        let rows = self.matcher.close(end);
+        match &mut self.forks {
+            Some(forks) => forks.filter(rows, now, &self.fates),
+            None => rows,
+        }
+    }
+
+    /// Stop certifying one provider (or all): first write any certified time that
+    /// is still pending, since it was verified before health was lost.
+    fn lose_health(&mut self, provider: Option<usize>) -> Vec<StorageRecord> {
+        let providers = match provider {
+            Some(index) => index..index + 1,
+            None => 0..self.coverage.len(),
+        };
+        let mut rows = Vec::new();
+        for provider in providers {
+            if let Some(Coverage {
+                start_utc,
+                certified: Some(end),
+                ..
+            }) = self.coverage[provider].take()
+            {
+                rows.push(StorageRecord::Coverage(CoverageRecord {
+                    stream: self.kind,
+                    provider,
+                    start: start_utc,
+                    end,
+                }));
+            }
+        }
+        rows
+    }
+
+    fn control(&mut self, control: StreamControl) -> Vec<StorageRecord> {
+        match control {
+            StreamControl::Connected {
+                provider,
+                at,
+                utc,
+                reason,
+                ..
+            } => {
+                let mut rows = self.lose_health(Some(provider));
+                self.connected[provider] = true;
+                // Healthy coverage starts with miss eligibility, after warmup.
+                self.coverage[provider] = Some(Coverage {
+                    start: at + self.connection_warmup,
+                    start_utc: utc + self.connection_warmup,
+                    certified: None,
+                });
+                rows.extend(
+                    self.matcher
+                        .connection_change(provider, at, utc, true, reason),
+                );
+                rows
+            }
+            StreamControl::Disconnected {
+                provider,
+                at,
+                utc,
+                reason,
+                ..
+            } => {
+                self.connected[provider] = false;
+                let mut rows = self.lose_health(Some(provider));
+                rows.extend(
+                    self.matcher
+                        .connection_change(provider, at, utc, false, reason),
+                );
+                rows
+            }
+            StreamControl::Gap {
+                provider,
+                at,
+                utc,
+                reason,
+                ..
+            } => {
+                // The matcher invalidates every provider's open comparisons: the
+                // dropped input may have been another provider's first arrival.
+                let mut rows = self.lose_health(None);
+                rows.extend(self.matcher.gap(Some(provider), at, utc, reason));
+                rows
+            }
+        }
+    }
+
+    fn arrival(&mut self, arrival: Arrival, processing_grace: Duration) -> Vec<StorageRecord> {
+        // A slot's fate is a fact regardless of whether this comparison is complete.
+        if let EventKey::Slot { slot, status } = arrival.key {
+            self.fates.record(slot, status);
+        }
+        let stale = Instant::now().duration_since(arrival.at) > processing_grace;
+        let mut rows = Vec::new();
+        if stale {
+            rows.extend(self.lose_health(None));
+            if !self.stale_invalidated {
+                self.stale_invalidated = true;
+                rows.extend(self.matcher.invalidate_open(
+                    None,
+                    arrival.at,
+                    arrival.utc,
+                    "processing grace exceeded",
+                ));
+            }
+            rows.extend(self.matcher.arrival_incomplete(arrival));
+        } else {
+            rows.extend(self.matcher.arrival(arrival));
+        }
+        if rows.iter().any(|row| matches!(row, StorageRecord::Gap(_))) {
+            rows.extend(self.lose_health(None));
+        }
+        rows
+    }
+}
+
+// A matcher owns one stream. Control events have precedence over closing windows;
+// arrivals must be drained before close, and the processing grace is ONLY applied
+// to close scheduling, never to the matcher's configured comparison window.
+// Healthy coverage is written at most once per `coverage_every` per provider.
+#[allow(clippy::too_many_arguments)]
+pub async fn match_stream(
+    kind: StreamKind,
+    count: usize,
+    config: Config,
+    mut arrivals: mpsc::Receiver<Arrival>,
+    mut controls: mpsc::Receiver<StreamControl>,
+    in_flight: Arc<InFlight>,
+    fates: Arc<SlotFates>,
+    mut stop: watch::Receiver<bool>,
+    storage: mpsc::Sender<StorageRecord>,
+    coverage_every: Duration,
+) -> Result<()> {
+    let mut state = StreamState::new(kind, count, &config, fates);
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        // Drain lifecycle changes before considering arrivals or certification. A reader
+        // sends its gap before reconnecting; a drop invalidates the whole pending interval.
+        for _ in 0..64 {
+            let Ok(control) = controls.try_recv() else {
+                break;
+            };
+            send_rows(&storage, state.control(control)).await?;
+        }
+        tokio::select! {
+            biased;
+            Ok(()) = stop.changed() => {
+                send_rows(&storage, state.stop()).await?;
+                return Ok(());
+            }
+            _ = tick.tick() => {
+                let now = Instant::now();
+                let utc = SystemTime::now();
+                let end = now - config.processing_grace;
+                let end_utc = utc - config.processing_grace;
+                // Check publications BEFORE draining the queues. An update or control
+                // stamped before `end` is either still published here, or its reader
+                // enqueued it before this check, so the drain below processes it.
+                let stalled = in_flight.published_before(end);
+                // Process everything already queued. A busy queue is normal under
+                // load and must not discard open windows; only an unprocessable
+                // stamp older than the cutoff can change a window closing now.
+                for _ in 0..controls.len() {
+                    let Ok(control) = controls.try_recv() else { break };
+                    send_rows(&storage, state.control(control)).await?;
+                }
+                for _ in 0..arrivals.len() {
+                    let Ok(arrival) = arrivals.try_recv() else { break };
+                    send_rows(&storage, state.arrival(arrival, config.processing_grace)).await?;
+                }
+                if stalled {
+                    send_rows(&storage, state.matcher.invalidate_open(
+                        None, now, utc, "reader stalled beyond processing grace",
+                    )).await?;
+                }
+                send_rows(&storage, state.close(end, now)).await?;
+                state.stale_invalidated = false;
+                // A full storage queue delays rows but cannot change results; it
+                // only withholds health certification.
+                if stalled || storage.capacity() == 0 {
+                    send_rows(&storage, state.lose_health(None)).await?;
+                    continue;
+                }
+                for provider in 0..count {
+                    let Some(mut coverage) = state.coverage[provider] else {
+                        if state.connected[provider] {
+                            // Begin afresh only after a fully drained tick; do not bridge
+                            // the unknown interval to any earlier certificate. Never
+                            // start before the provider's connection warmup ends.
+                            let warmup = state.matcher.eligible_since(provider)
+                                .map_or(Duration::ZERO, |since| since.saturating_duration_since(end));
+                            state.coverage[provider] = Some(Coverage {
+                                start: end + warmup, start_utc: end_utc + warmup, certified: None,
+                            });
+                        }
+                        continue;
+                    };
+                    if coverage.start >= end {
+                        continue;
+                    }
+                    if coverage.start_utc > end_utc {
+                        send_rows(&storage, state.lose_health(Some(provider))).await?;
+                        send_rows(&storage, state.matcher.invalidate_open(Some(provider), now, utc, "wall clock discontinuity")).await?;
+                        continue;
+                    }
+                    coverage.certified = Some(end_utc);
+                    if end.duration_since(coverage.start) >= coverage_every {
+                        storage.send(StorageRecord::Coverage(CoverageRecord {
+                            stream: kind, provider, start: coverage.start_utc, end: end_utc,
+                        })).await.context("storage writer stopped")?;
+                        coverage.certified = None;
+                        if end.duration_since(coverage.start) >= config.window {
+                            coverage.start = end - config.window;
+                            coverage.start_utc = end_utc - config.window;
+                        }
+                    }
+                    state.coverage[provider] = Some(coverage);
+                }
+            }
+            control = controls.recv() => {
+                let control = control.context("control channel closed")?;
+                send_rows(&storage, state.control(control)).await?;
+            }
+            arrival = arrivals.recv() => {
+                let arrival = arrival.context("arrival channel closed")?;
+                send_rows(&storage, state.arrival(arrival, config.processing_grace)).await?;
+            }
+        }
+    }
+}
+
+async fn send_rows(tx: &mpsc::Sender<StorageRecord>, rows: Vec<StorageRecord>) -> Result<()> {
+    for row in rows {
+        tx.send(row).await.context("storage writer stopped")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Outcome;
+    use yellowstone_grpc_proto::geyser::SlotStatus;
+
+    fn test_kind() -> StreamKind {
+        StreamKind {
+            data_type: DataType::Slot,
+            commitment: Commitment::Processed,
+        }
+    }
+
+    fn connected(provider: usize, at: Instant, utc: SystemTime) -> StreamControl {
+        StreamControl::Connected {
+            provider,
+            stream: test_kind(),
+            at,
+            utc,
+            reason: "subscribed".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_queue_control_precedes_close_and_suppresses_uncertified_miss() {
+        let mut config = Config::example();
+        config.window = Duration::from_millis(10);
+        config.processing_grace = Duration::from_millis(10);
+        let kind = StreamKind {
+            data_type: DataType::Slot,
+            commitment: Commitment::Processed,
+        };
+        let (arrivals_tx, arrivals_rx) = mpsc::channel(1);
+        let (controls_tx, controls_rx) = mpsc::channel(config.providers.len() * 4);
+        let (storage_tx, mut storage_rx) = mpsc::channel(32);
+        let at = Instant::now() - Duration::from_secs(2);
+        let utc = SystemTime::now() - Duration::from_secs(2);
+        for provider in 0..2 {
+            controls_tx
+                .try_send(StreamControl::Connected {
+                    provider,
+                    stream: kind,
+                    at,
+                    utc,
+                    reason: "subscribed".into(),
+                })
+                .unwrap();
+        }
+        arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 0,
+                key: EventKey::Slot { slot: 1, status: 0 },
+                at,
+                utc,
+            })
+            .unwrap();
+        assert!(arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 1,
+                key: EventKey::Slot { slot: 2, status: 0 },
+                at,
+                utc
+            })
+            .is_err());
+        controls_tx
+            .try_send(StreamControl::Gap {
+                provider: 1,
+                stream: kind,
+                at,
+                utc,
+                reason: "arrival queue full".into(),
+            })
+            .unwrap();
+        controls_tx
+            .try_send(StreamControl::Disconnected {
+                provider: 1,
+                stream: kind,
+                at,
+                utc,
+                reason: "arrival queue full".into(),
+            })
+            .unwrap();
+        let task = tokio::spawn(match_stream(
+            kind,
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::ZERO,
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut rows = Vec::new();
+        while let Ok(row) = storage_rx.try_recv() {
+            rows.push(row);
+        }
+        assert!(!rows.is_empty());
+        assert!(rows.iter().any(|r| matches!(r, StorageRecord::Gap(_))));
+        assert!(!rows.iter().any(|r| matches!(r, StorageRecord::Lag(_))));
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Coverage(c) if c.provider == 1)));
+        task.abort();
+    }
+    #[tokio::test(start_paused = true)]
+    async fn stamped_in_flight_update_blocks_clean_close_until_queue_send() {
+        let mut config = Config::example();
+        config.window = Duration::from_millis(100);
+        config.processing_grace = Duration::from_millis(10);
+        let (arrivals_tx, arrivals_rx) = mpsc::channel(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(32);
+        let in_flight = Arc::new(InFlight::new(2));
+        let connected_at = Instant::now() - Duration::from_secs(1);
+        let connected_utc = SystemTime::now() - Duration::from_secs(1);
+        for provider in 0..2 {
+            controls_tx
+                .try_send(connected(provider, connected_at, connected_utc))
+                .unwrap();
+        }
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            in_flight.clone(),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await; // initial idle tick
+        while storage_rx.try_recv().is_ok() {} // discard initial connected/coverage rows
+        let first = Instant::now();
+        let first_utc = SystemTime::now();
+        arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 0,
+                key: EventKey::Slot {
+                    slot: 17,
+                    status: 0,
+                },
+                at: first,
+                utc: first_utc,
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        // Reader B stamps its in-window observation, then is descheduled for
+        // longer than the processing grace before queueing it. Both channels
+        // remain empty; only the published stamp reveals the pending input.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let stamp = in_flight.stamp(1);
+        let second = stamp.at();
+        let second_utc = SystemTime::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let tick_rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert!(tick_rows.iter().any(
+            |r| matches!(r, StorageRecord::Gap(g) if g.reason == "reader stalled beyond processing grace")
+        ));
+        assert!(!tick_rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Lag(_) | StorageRecord::Coverage(_))));
+        arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 1,
+                key: EventKey::Slot {
+                    slot: 17,
+                    status: 0,
+                },
+                at: second,
+                utc: second_utc,
+            })
+            .unwrap();
+        drop(stamp); // reader clears after try_send
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert!(!rows.iter().any(|r| matches!(r, StorageRecord::Lag(l) if l.key == EventKey::Slot { slot: 17, status: 0 })));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_readers_still_finalize_and_certify_healthy_events() {
+        let mut config = Config::example();
+        config.window = Duration::from_millis(100);
+        config.processing_grace = Duration::from_millis(10);
+        let (arrivals_tx, arrivals_rx) = mpsc::channel(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(32);
+        let warmup = Config::example().connection_warmup;
+        let at = Instant::now() - warmup - Duration::from_secs(1);
+        let utc = SystemTime::now() - warmup - Duration::from_secs(1);
+        for provider in 0..2 {
+            controls_tx.try_send(connected(provider, at, utc)).unwrap();
+        }
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await;
+        let at = Instant::now();
+        arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 0,
+                key: EventKey::Slot {
+                    slot: 18,
+                    status: 0,
+                },
+                at,
+                utc: SystemTime::now(),
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert!(rows.iter().any(|r| matches!(r, StorageRecord::Lag(l) if l.key == EventKey::Slot { slot: 18, status: 0 } && l.provider == 0 && l.outcome == Outcome::OnTime)));
+        assert!(rows.iter().any(|r| matches!(r, StorageRecord::Lag(l) if l.key == EventKey::Slot { slot: 18, status: 0 } && l.provider == 1 && l.outcome == Outcome::Missed)));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Coverage(c) if c.provider == 1)));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_new_event_cannot_miss_peer_or_certify_wrong_lag() {
+        let mut config = Config::example();
+        config.window = Duration::from_secs(1);
+        config.processing_grace = Duration::from_millis(10);
+        let (arrivals_tx, arrivals_rx) = mpsc::channel(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(32);
+        let at = Instant::now() - Duration::from_secs(3);
+        let utc = SystemTime::now() - Duration::from_secs(3);
+        for provider in 0..2 {
+            controls_tx.try_send(connected(provider, at, utc)).unwrap();
+        }
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await; // initial clean tick, no arrival backlog
+        arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 0,
+                key: EventKey::Slot { slot: 9, status: 0 },
+                at,
+                utc,
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await; // closes incomplete key
+        tokio::task::yield_now().await;
+        arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 1,
+                key: EventKey::Slot { slot: 9, status: 0 },
+                at: at + Duration::from_millis(500),
+                utc: utc + Duration::from_millis(500),
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert!(rows.iter().any(|r| matches!(r, StorageRecord::Gap(g) if g.reason == "processing grace exceeded" && g.provider.is_none())));
+        assert!(!rows.iter().any(
+            |r| matches!(r, StorageRecord::Lag(l) if l.key == EventKey::Slot { slot: 9, status: 0 })
+        ));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backlog_recovers_coverage_without_reconnecting() {
+        let mut config = Config::example();
+        config.processing_grace = Duration::from_millis(10);
+        let (arrivals_tx, arrivals_rx) = mpsc::channel(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(32);
+        let at = Instant::now() - Duration::from_secs(2);
+        let utc = SystemTime::now() - Duration::from_secs(2);
+        controls_tx.try_send(connected(0, at, utc)).unwrap();
+        arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 0,
+                key: EventKey::Slot { slot: 1, status: 0 },
+                at,
+                utc,
+            })
+            .unwrap();
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await;
+        assert!(storage_rx.try_recv().is_ok());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert!(rows.iter().any(
+            |r| matches!(r, StorageRecord::Gap(g) if g.reason == "processing grace exceeded")
+        ));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Coverage(c) if c.provider == 0 && c.start > utc)));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_queue_at_tick_is_drained_instead_of_invalidating_windows() {
+        // Live data: ticks that found any queued arrival discarded every open
+        // window (~3s of events each, ~12% of processed data, biased to bursts).
+        let mut config = Config::example();
+        config.window = Duration::from_millis(100);
+        config.processing_grace = Duration::from_secs(2);
+        let (arrivals_tx, arrivals_rx) = mpsc::channel(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(64);
+        let at = Instant::now() - Duration::from_secs(1);
+        let utc = SystemTime::now() - Duration::from_secs(1);
+        for provider in 0..2 {
+            controls_tx.try_send(connected(provider, at, utc)).unwrap();
+        }
+        let first = Instant::now();
+        let first_utc = SystemTime::now();
+        let key = EventKey::Slot {
+            slot: 21,
+            status: 0,
+        };
+        // Both observations are already queued when the interval's immediate
+        // first tick fires, so the tick (biased first) finds a busy queue.
+        for (provider, delay_ms) in [(0, 0), (1, 3)] {
+            arrivals_tx
+                .try_send(Arrival {
+                    message_bytes: None,
+                    provider,
+                    key: key.clone(),
+                    at: first + Duration::from_millis(delay_ms),
+                    utc: first_utc,
+                })
+                .unwrap();
+        }
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await; // close after the grace
+        tokio::task::yield_now().await;
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        // Paused test time advances Instant but not SystemTime, so coverage reports a
+        // per-provider wall-clock discontinuity here; no window may be invalidated.
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Gap(g) if g.provider.is_none())));
+        let lags: Vec<_> = rows
+            .iter()
+            .filter_map(|r| match r {
+                StorageRecord::Lag(l) if l.key == key => Some((l.provider, l.outcome, l.lag_ns)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lags,
+            vec![
+                (0, Outcome::OnTime, Some(0)),
+                (1, Outcome::OnTime, Some(3_000_000))
+            ]
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_close_reclaims_expired_keys_while_arrivals_are_ready() {
+        let mut config = Config::example();
+        config.window = Duration::from_millis(10);
+        config.processing_grace = Duration::from_millis(1);
+        config.matcher_key_capacity = 1;
+        let (arrivals_tx, arrivals_rx) = mpsc::channel(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(32);
+        let at = Instant::now() - Duration::from_secs(2);
+        let utc = SystemTime::now() - Duration::from_secs(2);
+        controls_tx.try_send(connected(0, at, utc)).unwrap();
+        arrivals_tx
+            .try_send(Arrival {
+                message_bytes: None,
+                provider: 0,
+                key: EventKey::Slot { slot: 1, status: 0 },
+                at,
+                utc,
+            })
+            .unwrap();
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let at = Instant::now();
+        let utc = SystemTime::now();
+        for _ in 0..8 {
+            arrivals_tx
+                .try_send(Arrival {
+                    message_bytes: None,
+                    provider: 0,
+                    key: EventKey::Slot { slot: 2, status: 0 },
+                    at,
+                    utc,
+                })
+                .unwrap();
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert_eq!(
+            arrivals_tx.capacity(),
+            8,
+            "all queued arrivals were drained"
+        );
+        assert!(!rows.iter().any(|r| matches!(r, StorageRecord::Lag(_))));
+        assert!(!rows.iter().any(
+            |r| matches!(r, StorageRecord::Gap(g) if g.reason == "matcher key capacity exceeded")
+        ));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clock_rollback_never_certifies_inverted_interval() {
+        let mut config = Config::example();
+        config.processing_grace = Duration::from_millis(1);
+        let (_arrivals_tx, arrivals_rx) = mpsc::channel(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(32);
+        controls_tx
+            .try_send(connected(
+                0,
+                Instant::now() - Duration::from_secs(2),
+                SystemTime::now() + Duration::from_secs(60),
+            ))
+            .unwrap();
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await;
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Gap(g) if g.reason == "wall clock discontinuity")));
+        assert!(!rows.iter().any(|r| matches!(r, StorageRecord::Coverage(_))));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coverage_is_written_per_interval_and_flushed_when_health_is_lost() {
+        let mut config = Config::example();
+        config.window = Duration::from_millis(100);
+        config.processing_grace = Duration::from_millis(10);
+        let (_arrivals_tx, arrivals_rx) = mpsc::channel::<Arrival>(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(256);
+        let at = Instant::now() - Duration::from_secs(1);
+        let utc = SystemTime::now() - Duration::from_secs(1);
+        for provider in 0..2 {
+            controls_tx.try_send(connected(provider, at, utc)).unwrap();
+        }
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            watch::channel(false).1,
+            storage_tx,
+            Duration::from_secs(60),
+        ));
+        let coverage = |rows: &[StorageRecord], provider: usize| {
+            rows.iter()
+                .filter(|r| matches!(r, StorageRecord::Coverage(c) if c.provider == provider))
+                .count()
+        };
+        // 30 clean ticks: certified, but nothing written before the interval.
+        for _ in 0..30 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert_eq!((coverage(&rows, 0), coverage(&rows, 1)), (0, 0));
+        // Losing health flushes the pending certified time instead of dropping it.
+        // A provider's gap invalidates every provider's comparisons, so both flush.
+        controls_tx
+            .try_send(StreamControl::Gap {
+                provider: 1,
+                stream: test_kind(),
+                at: Instant::now(),
+                utc: SystemTime::now(),
+                reason: "test gap".into(),
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert_eq!((coverage(&rows, 0), coverage(&rows, 1)), (1, 1));
+        // Coverage restarts after the gap; a full interval later, each writes one row.
+        for _ in 0..65 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        assert_eq!((coverage(&rows, 0), coverage(&rows, 1)), (1, 1));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_writes_pending_coverage_and_exits() {
+        let mut config = Config::example();
+        config.window = Duration::from_millis(100);
+        config.processing_grace = Duration::from_millis(10);
+        let (_arrivals_tx, arrivals_rx) = mpsc::channel::<Arrival>(8);
+        let (controls_tx, controls_rx) = mpsc::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(256);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let at = Instant::now() - Duration::from_secs(1);
+        let utc = SystemTime::now() - Duration::from_secs(1);
+        for provider in 0..2 {
+            controls_tx.try_send(connected(provider, at, utc)).unwrap();
+        }
+        let task = tokio::spawn(match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals_rx,
+            controls_rx,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            stop_rx,
+            storage_tx,
+            Duration::from_secs(60),
+        ));
+        for _ in 0..30 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(!std::iter::from_fn(|| storage_rx.try_recv().ok())
+            .any(|row| matches!(row, StorageRecord::Coverage(_))));
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        let rows: Vec<_> = std::iter::from_fn(|| storage_rx.try_recv().ok()).collect();
+        let mut providers: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                StorageRecord::Coverage(coverage) => Some(coverage.provider),
+                _ => None,
+            })
+            .collect();
+        providers.sort_unstable();
+        assert_eq!(providers, [0, 1]);
+    }
+
+    #[test]
+    fn provider_gap_withdraws_every_providers_health() {
+        let config = Config::example();
+        let mut state = StreamState::new(test_kind(), 2, &config, Arc::default());
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        for provider in 0..2 {
+            state.control(connected(provider, at, utc));
+            state.coverage[provider].as_mut().unwrap().certified = Some(utc);
+        }
+        let rows = state.control(StreamControl::Gap {
+            provider: 0,
+            stream: test_kind(),
+            at,
+            utc,
+            reason: "arrival queue full".into(),
+        });
+        let mut providers: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                StorageRecord::Coverage(coverage) => Some(coverage.provider),
+                _ => None,
+            })
+            .collect();
+        providers.sort_unstable();
+        assert_eq!(providers, [0, 1]);
+        assert!(state.coverage.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn coverage_starts_after_connection_warmup() {
+        let mut config = Config::example();
+        config.connection_warmup = Duration::from_millis(1500);
+        let mut state = StreamState::new(test_kind(), 1, &config, Arc::default());
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        state.control(connected(0, at, utc));
+        let coverage = state.coverage[0].expect("coverage started");
+        assert_eq!(coverage.start, at + config.connection_warmup);
+        assert_eq!(coverage.start_utc, utc + config.connection_warmup);
+        assert_eq!(
+            state.matcher.eligible_since(0),
+            Some(at + config.connection_warmup)
+        );
+    }
+
+    #[test]
+    fn processed_misses_wait_for_the_slot_stream_to_confirm_or_fork() {
+        let mut config = Config::example();
+        config.connection_warmup = Duration::ZERO;
+        let fates = Arc::new(SlotFates::default());
+        let kind = |data_type| StreamKind {
+            data_type,
+            commitment: Commitment::Processed,
+        };
+        let mut txs = StreamState::new(kind(DataType::Transaction), 2, &config, fates.clone());
+        let mut slots = StreamState::new(kind(DataType::Slot), 2, &config, fates);
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        for provider in 0..2 {
+            txs.matcher
+                .connection_change(provider, at, utc, true, "subscribed");
+        }
+        let delivered = |slot: u64| Arrival {
+            message_bytes: Some(100),
+            provider: 0,
+            key: EventKey::Transaction {
+                slot,
+                signature: vec![slot as u8],
+            },
+            at: at + Duration::from_millis(1),
+            utc,
+        };
+        txs.arrival(delivered(10), config.processing_grace);
+        txs.arrival(delivered(11), config.processing_grace);
+        let outcomes = |rows: Vec<StorageRecord>| -> Vec<(u64, usize, Outcome)> {
+            rows.into_iter()
+                .filter_map(|row| match row {
+                    StorageRecord::Lag(lag) => Some((lag.key.slot(), lag.provider, lag.outcome)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Provider 1 never delivered: only the on-time rows are written at close.
+        let end = at + config.window + Duration::from_secs(1);
+        let mut rows = outcomes(txs.close(end, end));
+        rows.sort_unstable_by_key(|row| row.0);
+        assert_eq!(rows, [(10, 0, Outcome::OnTime), (11, 0, Outcome::OnTime)]);
+        let slot = |slot, status: SlotStatus| Arrival {
+            message_bytes: None,
+            provider: 1,
+            key: EventKey::Slot {
+                slot,
+                status: status as i32,
+            },
+            at: end,
+            utc,
+        };
+        slots.arrival(slot(10, SlotStatus::SlotConfirmed), Duration::MAX);
+        slots.arrival(slot(11, SlotStatus::SlotDead), Duration::MAX);
+        let mut rows = outcomes(txs.close(end, end));
+        rows.sort_unstable_by_key(|row| row.0);
+        assert_eq!(rows, [(10, 1, Outcome::Missed), (11, 1, Outcome::Forked)]);
+    }
+}

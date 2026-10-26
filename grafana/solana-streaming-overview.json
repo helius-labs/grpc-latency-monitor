@@ -1,0 +1,1037 @@
+{
+  "timezone": "",
+  "editable": true,
+  "graphTooltip": 0,
+  "fiscalYearStartMonth": 0,
+  "schemaVersion": 42,
+  "templating": {
+    "list": [
+      {
+        "type": "query",
+        "name": "data_type",
+        "skipUrlSync": false,
+        "multi": false,
+        "allowCustomValue": false,
+        "includeAll": false,
+        "auto": false,
+        "auto_min": "10s",
+        "auto_count": 30,
+        "label": "Stream",
+        "description": "All pools events using the latest configuration per stream.",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "benchmark-clickhouse"
+        },
+        "query": "SELECT DISTINCT data_type FROM benchmark_subscription_versions ORDER BY data_type",
+        "definition": "SELECT DISTINCT data_type FROM benchmark_subscription_versions ORDER BY data_type",
+        "refresh": 1,
+        "sort": 1,
+        "staticOptions": [
+          {
+            "text": "All",
+            "value": "__all"
+          }
+        ],
+        "staticOptionsOrder": "before",
+        "current": {
+          "text": "transaction",
+          "value": "transaction"
+        }
+      },
+      {
+        "type": "query",
+        "name": "commitment",
+        "skipUrlSync": false,
+        "multi": false,
+        "allowCustomValue": true,
+        "includeAll": false,
+        "auto": false,
+        "auto_min": "10s",
+        "auto_count": 30,
+        "label": "Commitment",
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "benchmark-clickhouse"
+        },
+        "query": "SELECT DISTINCT commitment FROM benchmark_subscription_versions ORDER BY commitment",
+        "definition": "SELECT DISTINCT commitment FROM benchmark_subscription_versions ORDER BY commitment",
+        "refresh": 1,
+        "sort": 1,
+        "current": {
+          "text": "processed",
+          "value": "processed"
+        }
+      }
+    ]
+  },
+  "annotations": {},
+  "title": "Solana Benchmark — Overview",
+  "uid": "solana-streaming-overview",
+  "tags": [
+    "solana",
+    "benchmark"
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "panels": [
+    {
+      "type": "row",
+      "collapsed": false,
+      "id": 30,
+      "panels": [],
+      "title": "Performance",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "type": "table",
+      "transparent": false,
+      "repeatDirection": "h",
+      "options": {
+        "frameIndex": 0,
+        "showHeader": true,
+        "showTypeIcons": false,
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false
+        },
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center",
+            "inspect": false,
+            "minWidth": 70,
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
+          },
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "—",
+                  "color": "transparent"
+                }
+              }
+            },
+            {
+              "type": "regex",
+              "options": {
+                "pattern": "^W\\|(.*)$",
+                "result": {
+                  "text": "$1%",
+                  "color": "#56A64B"
+                }
+              }
+            },
+            {
+              "type": "regex",
+              "options": {
+                "pattern": "^Y\\|(.*)$",
+                "result": {
+                  "text": "$1%",
+                  "color": "#EAB839"
+                }
+              }
+            },
+            {
+              "type": "regex",
+              "options": {
+                "pattern": "^R\\|(.*)$",
+                "result": {
+                  "text": "$1%",
+                  "color": "#F2495C"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "location\\provider"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Location"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              }
+            ]
+          }
+        ]
+      },
+      "id": 20,
+      "title": "Win rate",
+      "description": "Share of wins within each location: the first on-time delivery of an event that at least two connected providers competed for. Dropping an event loses it. Each row sums to 100%. Green = the location’s leader (ties share it), yellow ≥10%, red <10%.",
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "benchmark-clickhouse"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 1,
+        "w": 12,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "benchmark-clickhouse"
+          },
+          "queryType": "sql",
+          "editorType": "sql",
+          "rawSql": "WITH (SELECT groupArray(tuple(region, cloud_provider, bucket, generation)) FROM (SELECT c.region, c.cloud_provider, c.bucket, c.generation FROM\n (SELECT region, cloud_provider, bucket, max(commits.generation) generation, argMax(commits.revision, commits.generation) revision\n  FROM benchmark_rollup_commits AS commits\n  WHERE bucket + INTERVAL 1 MINUTE > $__fromTime_ms AND bucket < $__toTime_ms\n  AND ((bucket >= $__fromTime_ms AND bucket + INTERVAL 1 MINUTE <= $__toTime_ms) OR bucket < now() - INTERVAL 6 HOUR) GROUP BY region, cloud_provider, bucket) c\n LEFT JOIN (SELECT region, cloud_provider, bucket, max(revision) revision FROM benchmark_dirty_minutes\n  WHERE bucket + INTERVAL 1 MINUTE > $__fromTime_ms AND bucket < $__toTime_ms\n  AND ((bucket >= $__fromTime_ms AND bucket + INTERVAL 1 MINUTE <= $__toTime_ms) OR bucket < now() - INTERVAL 6 HOUR) GROUP BY region, cloud_provider, bucket) d\n ON c.region = d.region AND c.cloud_provider = d.cloud_provider AND c.bucket = d.bucket WHERE c.revision >= d.revision)) AS rollup_generations\n SELECT * FROM (SELECT * EXCEPT (region, cloud_provider),\n if(win_percent IS NULL, NULL, concat(multiIf(\n   toFloat64(toDecimalString(win_percent, 1)) = max(toFloat64(toDecimalString(win_percent, 1))) OVER (PARTITION BY region, cloud_provider), 'W', toFloat64(toDecimalString(win_percent, 1)) >= 10, 'Y', 'R'),\n   '|', toDecimalString(win_percent, 1))) AS win_cell\n FROM (SELECT\n concat(region, if(uniqExact(cloud_provider) OVER (PARTITION BY region) > 1, concat('/', cloud_provider), '')) AS location,\n region, cloud_provider, provider, win_percent, p50_lag_ms, p99_lag_ms, dropped_percent,\n disconnected_seconds, disconnects\n FROM (SELECT region, cloud_provider, provider, quantilesTDigestIfMerge(0.5, 0.99)(percentiles) AS qs,\n sum(wins) / nullIf(sum(sum(wins)) OVER (PARTITION BY region, cloud_provider), 0) * 100 AS win_percent,\n if(sum(delivered) > 0, qs[1] / 1e6, NULL) AS p50_lag_ms,\n if(sum(delivered) > 0, qs[2] / 1e6, NULL) AS p99_lag_ms,\n sum(missed) / nullIf(sum(delivered) + sum(missed), 0) * 100 AS dropped_percent\n FROM (SELECT * FROM benchmark_minute_rollups WHERE kind = 'provider' AND (${data_type:sqlstring} = '__all' OR data_type = ${data_type:sqlstring}) AND commitment = ${commitment:sqlstring}\n AND bucket + INTERVAL 1 MINUTE > $__fromTime_ms AND bucket < $__toTime_ms\n AND (region, cloud_provider, bucket, generation) IN (SELECT tupleElement(r, 1), tupleElement(r, 2), tupleElement(r, 3), tupleElement(r, 4)\n FROM (SELECT arrayJoin(rollup_generations) AS r)) AND (region, cloud_provider, data_type, subscription_id) IN (\n   SELECT region, cloud_provider, data_type,\n argMax(subscription_id, tuple(observed, last_seen, subscription_id)) AS subscription_id\n FROM (SELECT region, cloud_provider, data_type, subscription_id, last_seen, toUInt8(1) AS observed FROM (SELECT region, cloud_provider, data_type, subscription_id, last_seen\n   FROM benchmark_minute_rollups WHERE kind = 'provider' AND (${data_type:sqlstring} = '__all' OR data_type = ${data_type:sqlstring}) AND commitment = ${commitment:sqlstring}\n AND bucket + INTERVAL 1 MINUTE > $__fromTime_ms AND bucket < $__toTime_ms\n AND (region, cloud_provider, bucket, generation) IN (SELECT tupleElement(r, 1), tupleElement(r, 2), tupleElement(r, 3), tupleElement(r, 4)\n FROM (SELECT arrayJoin(rollup_generations) AS r)))\n UNION ALL SELECT region, cloud_provider, data_type, subscription_id, last_seen, toUInt8(0) AS observed\n FROM (SELECT region, cloud_provider, data_type, subscription_id, provider, event_utc AS last_seen\n FROM benchmark_connection_events WHERE (${data_type:sqlstring} = '__all' OR data_type = ${data_type:sqlstring}) AND commitment = ${commitment:sqlstring}\n AND event_utc >= $__fromTime_ms - INTERVAL 1 DAY AND event_utc <= $__toTime_ms)) GROUP BY region, cloud_provider, data_type)) GROUP BY region, cloud_provider, provider) AS metrics\n -- Providers without recorded disconnects get zero downtime (non-Nullable defaults).\n FULL JOIN (SELECT region, cloud_provider, provider,\n sumIf(greatest(0, dateDiff('millisecond', greatest(start_utc, range_start), least(end_utc, range_end))),\n   dateDiff('millisecond', start_utc, end_utc) >= 10000) / 1000 AS disconnected_seconds,\n countIf(start_utc >= range_start AND start_utc <= range_end) AS disconnects\n FROM (SELECT region, cloud_provider, provider, min(event_utc) AS start_utc, max(next_utc) AS end_utc,\n  any(range_start) AS range_start, any(range_end) AS range_end\n  FROM (SELECT region, cloud_provider, provider, subscription_id, event_utc,\n   NOT connected AND reason NOT IN ('arrival queue full', 'control queue full') AS provider_down,\n   CAST($__fromTime_ms AS DateTime64(9, 'UTC')) AS range_start,\n   CAST($__toTime_ms AS DateTime64(9, 'UTC')) AS range_end,\n   -- Rows of one outage share the last transition before them that was not downtime.\n   maxIf(event_utc, connected OR reason IN ('arrival queue full', 'control queue full')) OVER before AS outage,\n   leadInFrame(event_utc, 1, least(now64(9, 'UTC'), range_end + INTERVAL 10 SECOND)) OVER stream AS next_utc\n   FROM benchmark_connection_events WHERE (${data_type:sqlstring} = '__all' OR data_type = ${data_type:sqlstring}) AND commitment = ${commitment:sqlstring} AND (region, cloud_provider, data_type, subscription_id) IN (\n   SELECT region, cloud_provider, data_type,\n argMax(subscription_id, tuple(observed, last_seen, subscription_id)) AS subscription_id\n FROM (SELECT region, cloud_provider, data_type, subscription_id, last_seen, toUInt8(1) AS observed FROM (SELECT region, cloud_provider, data_type, subscription_id, last_seen\n   FROM benchmark_minute_rollups WHERE kind = 'provider' AND (${data_type:sqlstring} = '__all' OR data_type = ${data_type:sqlstring}) AND commitment = ${commitment:sqlstring}\n AND bucket + INTERVAL 1 MINUTE > $__fromTime_ms AND bucket < $__toTime_ms\n AND (region, cloud_provider, bucket, generation) IN (SELECT tupleElement(r, 1), tupleElement(r, 2), tupleElement(r, 3), tupleElement(r, 4)\n FROM (SELECT arrayJoin(rollup_generations) AS r)))\n UNION ALL SELECT region, cloud_provider, data_type, subscription_id, last_seen, toUInt8(0) AS observed\n FROM (SELECT region, cloud_provider, data_type, subscription_id, provider, event_utc AS last_seen\n FROM benchmark_connection_events WHERE (${data_type:sqlstring} = '__all' OR data_type = ${data_type:sqlstring}) AND commitment = ${commitment:sqlstring}\n AND event_utc >= $__fromTime_ms - INTERVAL 1 DAY AND event_utc <= $__toTime_ms)) GROUP BY region, cloud_provider, data_type)\n   AND event_utc <= $__toTime_ms + INTERVAL 10 SECOND AND event_utc >= $__fromTime_ms - INTERVAL 1 DAY\n   WINDOW stream AS (PARTITION BY region, cloud_provider, provider, subscription_id ORDER BY event_utc\n    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),\n   before AS (PARTITION BY region, cloud_provider, provider, subscription_id ORDER BY event_utc\n    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING))\n  WHERE provider_down GROUP BY region, cloud_provider, provider, subscription_id, outage)\n GROUP BY region, cloud_provider, provider) AS downtime USING (region, cloud_provider, provider))\n ORDER BY provider, location)\n SETTINGS max_threads = 16, max_execution_time = 45",
+          "format": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "location",
+                "provider",
+                "win_cell"
+              ]
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "rowField": "location",
+            "columnField": "provider",
+            "valueField": "win_cell",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "location\\provider"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "transparent": false,
+      "repeatDirection": "h",
+      "options": {
+        "frameIndex": 0,
+        "showHeader": true,
+        "showTypeIcons": false,
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false
+        },
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center",
+            "inspect": false,
+            "minWidth": 70,
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
+          },
+          "unit": "ms",
+          "decimals": 2,
+          "min": 0,
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "—",
+                  "color": "transparent"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "#56A64B"
+              },
+              {
+                "value": 0.005,
+                "color": "#EAB839"
+              },
+              {
+                "value": 1,
+                "color": "#FF9830"
+              },
+              {
+                "value": 5,
+                "color": "#F2495C"
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "location\\provider"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Location"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              }
+            ]
+          }
+        ]
+      },
+      "id": 21,
+      "title": "p50 lag behind ideal",
+      "description": "Median on-time lag behind each event’s earliest provider arrival at that location. Lower is better; dropped events are excluded.",
+      "datasource": {
+        "type": "datasource",
+        "uid": "-- Dashboard --"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
+          },
+          "panelId": 20,
+          "withTransforms": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "location",
+                "provider",
+                "p50_lag_ms"
+              ]
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "rowField": "location",
+            "columnField": "provider",
+            "valueField": "p50_lag_ms",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "location\\provider"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "transparent": false,
+      "repeatDirection": "h",
+      "options": {
+        "frameIndex": 0,
+        "showHeader": true,
+        "showTypeIcons": false,
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false
+        },
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center",
+            "inspect": false,
+            "minWidth": 70,
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
+          },
+          "unit": "ms",
+          "decimals": 1,
+          "min": 0,
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "—",
+                  "color": "transparent"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "#56A64B"
+              },
+              {
+                "value": 10,
+                "color": "#EAB839"
+              },
+              {
+                "value": 20,
+                "color": "#FF9830"
+              },
+              {
+                "value": 100,
+                "color": "#F2495C"
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "location\\provider"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Location"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              }
+            ]
+          }
+        ]
+      },
+      "id": 22,
+      "title": "p99 lag behind ideal",
+      "description": "99th percentile on-time lag behind each event’s earliest provider arrival at that location. Lower is better; dropped events are excluded.",
+      "datasource": {
+        "type": "datasource",
+        "uid": "-- Dashboard --"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
+          },
+          "panelId": 20,
+          "withTransforms": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "location",
+                "provider",
+                "p99_lag_ms"
+              ]
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "rowField": "location",
+            "columnField": "provider",
+            "valueField": "p99_lag_ms",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "location\\provider"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "collapsed": false,
+      "id": 31,
+      "panels": [],
+      "title": "Reliability",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "type": "table",
+      "transparent": false,
+      "repeatDirection": "h",
+      "options": {
+        "frameIndex": 0,
+        "showHeader": true,
+        "showTypeIcons": false,
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false
+        },
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center",
+            "inspect": false,
+            "minWidth": 70,
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
+          },
+          "unit": "percent",
+          "decimals": 2,
+          "min": 0,
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "—",
+                  "color": "transparent"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "#56A64B"
+              },
+              {
+                "value": 0.1,
+                "color": "#EAB839"
+              },
+              {
+                "value": 0.5,
+                "color": "#FF9830"
+              },
+              {
+                "value": 1,
+                "color": "#F2495C"
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "location\\provider"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Location"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              }
+            ]
+          }
+        ]
+      },
+      "id": 23,
+      "title": "Dropped",
+      "description": "Share of a connected provider’s events not delivered within 5 s of the first provider’s delivery.",
+      "datasource": {
+        "type": "datasource",
+        "uid": "-- Dashboard --"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 24,
+        "w": 12,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
+          },
+          "panelId": 20,
+          "withTransforms": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "location",
+                "provider",
+                "dropped_percent"
+              ]
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "rowField": "location",
+            "columnField": "provider",
+            "valueField": "dropped_percent",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "location\\provider"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "transparent": false,
+      "repeatDirection": "h",
+      "options": {
+        "frameIndex": 0,
+        "showHeader": true,
+        "showTypeIcons": false,
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false
+        },
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center",
+            "inspect": false,
+            "minWidth": 70,
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
+          },
+          "unit": "s",
+          "decimals": 1,
+          "min": 0,
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "—",
+                  "color": "transparent"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "#56A64B"
+              },
+              {
+                "value": 0.001,
+                "color": "#EAB839"
+              },
+              {
+                "value": 10,
+                "color": "#FF9830"
+              },
+              {
+                "value": 60,
+                "color": "#F2495C"
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "location\\provider"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Location"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              }
+            ]
+          }
+        ]
+      },
+      "id": 24,
+      "title": "Downtime",
+      "description": "Time each provider’s streams at that location could not reconnect: outages lasting at least 10 s, from a disconnect until the next successful subscription, summed over streams. A shorter interruption, such as a rolling restart that accepts the reconnect right away, counts only as a disconnect. Disconnects caused by the subscriber’s own backlog are excluded. A stalled stream counts only from the moment it is dropped for inactivity (30 s without traffic); events in the stall count as dropped.",
+      "datasource": {
+        "type": "datasource",
+        "uid": "-- Dashboard --"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 12,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
+          },
+          "panelId": 20,
+          "withTransforms": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "location",
+                "provider",
+                "disconnected_seconds"
+              ]
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "rowField": "location",
+            "columnField": "provider",
+            "valueField": "disconnected_seconds",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "location\\provider"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "transparent": false,
+      "repeatDirection": "h",
+      "options": {
+        "frameIndex": 0,
+        "showHeader": true,
+        "showTypeIcons": false,
+        "footer": {
+          "show": false,
+          "reducer": [],
+          "countRows": false
+        },
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "center",
+            "inspect": false,
+            "minWidth": 70,
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
+          },
+          "unit": "none",
+          "decimals": 0,
+          "min": 0,
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "—",
+                  "color": "transparent"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "#56A64B"
+              },
+              {
+                "value": 1,
+                "color": "#EAB839"
+              },
+              {
+                "value": 3,
+                "color": "#FF9830"
+              },
+              {
+                "value": 10,
+                "color": "#F2495C"
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "location\\provider"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Location"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "left"
+              }
+            ]
+          }
+        ]
+      },
+      "id": 25,
+      "title": "Disconnects",
+      "description": "How often each provider’s streams at that location were interrupted, including short reconnects that are not downtime. Disconnects caused by the subscriber’s own backlog are excluded.",
+      "datasource": {
+        "type": "datasource",
+        "uid": "-- Dashboard --"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 35,
+        "w": 12,
+        "h": 11
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
+          },
+          "panelId": 20,
+          "withTransforms": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "location",
+                "provider",
+                "disconnects"
+              ]
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "rowField": "location",
+            "columnField": "provider",
+            "valueField": "disconnects",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "location\\provider"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "links": [
+    {
+      "title": "Solana Benchmark — All Providers",
+      "type": "link",
+      "icon": "",
+      "tooltip": "",
+      "tags": [],
+      "asDropdown": false,
+      "placement": "inControlsMenu",
+      "targetBlank": false,
+      "includeVars": true,
+      "keepTime": true,
+      "url": "/d/solana-streaming-benchmark"
+    },
+    {
+      "title": "Solana Benchmark — Head to Head",
+      "type": "link",
+      "icon": "",
+      "tooltip": "",
+      "tags": [],
+      "asDropdown": false,
+      "placement": "inControlsMenu",
+      "targetBlank": false,
+      "includeVars": true,
+      "keepTime": true,
+      "url": "/d/solana-streaming-head-to-head"
+    }
+  ]
+}
