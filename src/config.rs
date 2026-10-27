@@ -12,6 +12,7 @@ pub struct Config {
     pub state_dir: std::path::PathBuf,
     pub subscriber: SubscriberConfig,
     pub providers: Vec<ProviderConfig>,
+    pub slot_validation: SlotValidationConfig,
     pub clickhouse: ClickHouseConfig,
     #[serde(default)]
     pub filters: FiltersConfig,
@@ -23,7 +24,7 @@ pub struct Config {
     pub flush_interval: Duration,
     /// The only comparison window, measured from the first provider's delivery.
     /// Deliveries strictly inside it are on time; anything later counts as
-    /// dropped (missed), even if it arrives afterwards.
+    /// a missed deadline, even if it arrives afterwards.
     #[serde(with = "humantime_serde")]
     pub window: Duration,
     #[serde(with = "humantime_serde")]
@@ -35,15 +36,15 @@ pub struct Config {
     pub expired_key_retention: Duration,
     /// Closed keys remembered exactly, per stream. Defaults to enough to cover
     /// `expired_key_retention` at the rate `matcher_key_capacity` is sized for;
-    /// keys forgotten earlier are still rejected by a slot floor.
+    /// forgotten keys are still rejected by a slot floor, including normal expiry.
     #[serde(default)]
     expired_key_capacity: Option<usize>,
-    /// After each subscription, how long before a provider can count as dropping
-    /// an event and before healthy coverage starts. Zero disables the warmup.
+    /// After each subscription, how long before a provider can record a missed
+    /// deadline and before healthy coverage starts. Zero disables the warmup.
     #[serde(default = "default_connection_warmup", with = "humantime_serde")]
     pub connection_warmup: Duration,
-    /// How long a processed miss waits for its slot to be confirmed, dead or passed
-    /// by a finalized slot. Undecided misses then count as forked, not dropped.
+    /// How long a processed miss waits for its slot to be confirmed or dead.
+    /// Undecided misses then count as forked, not a missed deadline.
     #[serde(
         default = "default_slot_confirmation_timeout",
         with = "humantime_serde"
@@ -52,6 +53,60 @@ pub struct Config {
     /// Removed setting, accepted only to explain the migration at startup.
     #[serde(default, rename = "late_period")]
     removed_late_period: Option<serde::de::IgnoredAny>,
+}
+
+/// Reference RPC credentials stay in the environment. Tuning is optional.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlotValidationConfig {
+    pub rpc_url_env: String,
+    #[serde(default = "default_slot_buffer")]
+    pub slot_buffer: u64,
+    #[serde(default = "default_poll_interval", with = "humantime_serde")]
+    pub poll_interval: Duration,
+    #[serde(default = "default_request_timeout", with = "humantime_serde")]
+    pub request_timeout: Duration,
+    #[serde(default = "default_reference_age", with = "humantime_serde")]
+    pub max_reference_age: Duration,
+}
+
+fn default_slot_buffer() -> u64 {
+    25
+}
+fn default_poll_interval() -> Duration {
+    Duration::from_secs(1)
+}
+fn default_request_timeout() -> Duration {
+    Duration::from_secs(2)
+}
+fn default_reference_age() -> Duration {
+    Duration::from_secs(5)
+}
+
+impl SlotValidationConfig {
+    pub fn rpc_url(&self) -> Result<String> {
+        credential(&self.rpc_url_env, "reference RPC URL")?;
+        let value = std::env::var(&self.rpc_url_env)
+            .map_err(|_| anyhow::anyhow!("reference RPC URL must be valid Unicode"))?;
+        let url = reqwest::Url::parse(&value)
+            .map_err(|_| anyhow::anyhow!("reference RPC URL must be an HTTP(S) URL"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            bail!("reference RPC URL must be an HTTP(S) URL");
+        }
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.rpc_url()?;
+        if self.poll_interval.is_zero()
+            || self.request_timeout.is_zero()
+            || self.max_reference_age <= self.poll_interval
+            || self.max_reference_age <= self.request_timeout
+        {
+            bail!("reference RPC durations must be positive; max_reference_age must exceed poll_interval and request_timeout");
+        }
+        Ok(())
+    }
 }
 
 fn default_state_dir() -> std::path::PathBuf {
@@ -157,9 +212,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.slot_validation.validate()?;
         if self.removed_late_period.is_some() {
             bail!(
-                "`late_period` was removed: a delivery after `window` now counts as dropped \
+                "`late_period` was removed: a delivery after `window` now counts as a missed deadline \
                  (missed). Delete `late_period` and set `window` to the latest delivery you \
                  still consider on time (for example \"5s\")"
             );
@@ -244,6 +300,10 @@ fn credential(variable: &str, label: &str) -> Result<()> {
 #[cfg(test)]
 impl Config {
     pub(crate) fn example() -> Self {
+        std::env::set_var(
+            "BENCH_REFERENCE_RPC_URL",
+            "https://reference.invalid/private-test-key",
+        );
         std::env::set_var("INTEGRATION_CH_USER", "test");
         std::env::set_var("INTEGRATION_CH_PASSWORD", "test");
         std::env::set_var("BENCH_PROVIDER_A_TOKEN", "test");
@@ -261,6 +321,10 @@ mod tests {
     use super::*;
 
     fn example() -> String {
+        std::env::set_var(
+            "BENCH_REFERENCE_RPC_URL",
+            "https://reference.invalid/private-test-key",
+        );
         std::env::set_var("BENCH_TEST_CH_USER", "test");
         std::env::set_var("BENCH_TEST_CH_PASSWORD", "test");
         std::env::set_var("BENCH_TEST_PROVIDER_TOKEN", "secret");
@@ -268,6 +332,55 @@ mod tests {
             .replace("BENCH_CH_USER", "BENCH_TEST_CH_USER")
             .replace("BENCH_CH_PASSWORD", "BENCH_TEST_CH_PASSWORD")
             .replace("BENCH_PROVIDER_A_TOKEN", "BENCH_TEST_PROVIDER_TOKEN")
+    }
+
+    #[test]
+    fn reference_rpc_is_required_and_defaults_and_errors_are_safe() {
+        let text = example();
+        let config = Config::from_yaml(&text).unwrap();
+        let reference = &config.slot_validation;
+        assert_eq!(reference.slot_buffer, 25);
+        assert_eq!(reference.poll_interval, Duration::from_secs(1));
+        assert_eq!(reference.request_timeout, Duration::from_secs(2));
+        assert_eq!(reference.max_reference_age, Duration::from_secs(5));
+        assert_eq!(
+            Config::from_yaml(&text.replace("  slot_buffer: 25\n", ""))
+                .unwrap()
+                .slot_validation
+                .slot_buffer,
+            25
+        );
+        for (name, value) in [
+            ("poll_interval", "0s"),
+            ("request_timeout", "0s"),
+            ("max_reference_age", "1s"),
+            ("max_reference_age", "2s"),
+        ] {
+            let invalid = text.replace(
+                "  slot_buffer: 25",
+                &format!("  slot_buffer: 25\n  {name}: {value}"),
+            );
+            assert!(Config::from_yaml(&invalid).is_err(), "{name}={value}");
+        }
+        assert!(Config::from_yaml(&text.replace(
+            "BENCH_REFERENCE_RPC_URL",
+            "BENCH_TEST_MISSING_REFERENCE_RPC_URL"
+        ))
+        .is_err());
+        std::env::set_var(
+            "BENCH_TEST_INVALID_REFERENCE_RPC_URL",
+            "file:///private-test-token",
+        );
+        let invalid = text.replace(
+            "BENCH_REFERENCE_RPC_URL",
+            "BENCH_TEST_INVALID_REFERENCE_RPC_URL",
+        );
+        assert!(!format!("{:#}", Config::from_yaml(&invalid).unwrap_err())
+            .contains("private-test-token"));
+        assert!(
+            Config::from_yaml(&text.replace("slot_validation:", "unused_slot_validation:"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -347,7 +460,7 @@ mod tests {
         let text = example().replace("window: \"5s\"", "window: \"1s\"\nlate_period: \"10s\"");
         let error = format!("{:#}", Config::from_yaml(&text).unwrap_err());
         assert!(error.contains("`late_period` was removed"), "{error}");
-        assert!(error.contains("counts as dropped"), "{error}");
+        assert!(error.contains("counts as a missed deadline"), "{error}");
     }
 
     #[test]

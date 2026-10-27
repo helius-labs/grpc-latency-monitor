@@ -1,17 +1,17 @@
 # Solana Streaming Benchmark
 
-Compares Yellowstone gRPC providers by when the same Solana events (accounts, transactions, slots) reach your subscriber: who delivers first, by how much, and who drops events. Results go to ClickHouse and Grafana.
+Compares Yellowstone gRPC providers by when the same Solana events (accounts, transactions, slots) reach your subscriber: who delivers first, by how much, and who misses delivery deadlines. Results go to ClickHouse and Grafana.
 
 > **Disclosure:** Built and maintained by Helius, one of the providers it can measure. Results favor providers close to the subscriber, so compare from more than one location.
 
 ## Quick start
 
-Needs Rust, Docker and Yellowstone gRPC endpoints.
+Needs Rust, Docker, Yellowstone gRPC endpoints and a trusted Solana JSON-RPC endpoint for slot validation.
 
 ```sh
 docker compose up -d   # ClickHouse :8123, Grafana :3000 (override with CLICKHOUSE_PORT, GRAFANA_PORT)
 cp config.example.yaml config.local.yaml   # set providers, filters, location; clickhouse.url: http://localhost:8123
-cp .env.example .env                       # BENCH_CH_USER=benchmark, BENCH_CH_PASSWORD=benchmark, provider tokens
+cp .env.example .env                       # ClickHouse credentials, provider tokens, BENCH_REFERENCE_RPC_URL
 cargo run --release -- --config config.local.yaml
 ```
 

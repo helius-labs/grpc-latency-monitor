@@ -6,6 +6,7 @@ Installing, configuring and running a subscriber. To try it locally first, see t
 
 - Rust (see `rust-version` in `Cargo.toml`).
 - Yellowstone gRPC endpoints that permit the configured subscriptions. Empty account or transaction filter lists request all messages of that type, which can have substantial bandwidth and ClickHouse storage cost; size and load-test before production.
+- A trusted Solana HTTP(S) JSON-RPC endpoint for `getSlot` reference polling.
 - ClickHouse with a database created for the benchmark, and a user authorized to insert into its tables.
 
 ## Configuration
@@ -14,6 +15,7 @@ Copy `config.example.yaml` to a local file (`*.local.yaml` and `*.local.yml` are
 
 - account `owner` and transaction `account_include` public-key lists,
 - provider endpoint URLs, and environment-variable **names** for their credentials,
+- `slot_validation.rpc_url_env`, naming the environment variable holding the reference RPC URL,
 - subscriber `region`, `cloud_provider`, `latitude` and `longitude` (all required).
 
 The example contains no working endpoints or secrets. Run one instance and configuration per `(region, cloud_provider)` pair. Filter lists are sorted and deduplicated before building the same request for every provider; changing a list changes that stream's subscription ID, keeping historical comparisons separate.
@@ -30,7 +32,25 @@ subscriber:
 
 ## Credentials
 
-The benchmark loads `.env` from the current working directory before reading configuration. Copy `.env.example` to `.env` and set your ClickHouse credentials and provider tokens there. Already exported environment variables take precedence. A missing `.env` is allowed; an unreadable or malformed file causes a startup error. Never put provider tokens in log messages.
+The benchmark loads `.env` from the current working directory before reading configuration. Copy `.env.example` to `.env` and set your ClickHouse credentials, provider tokens and `BENCH_REFERENCE_RPC_URL` there. Already exported environment variables take precedence. A missing `.env` is allowed; an unreadable or malformed file causes a startup error. Never put provider tokens or RPC URLs containing API keys in log messages.
+
+## Slot reference
+
+`slot_validation` is required. Existing configurations must add this block and set the named environment variable:
+
+```yaml
+slot_validation:
+  rpc_url_env: BENCH_REFERENCE_RPC_URL
+  slot_buffer: 25
+```
+
+One background task polls `getSlot` at processed, confirmed and finalized commitments, making three requests per poll. Optional settings are `poll_interval` (default `1s`), `request_timeout` (`2s`) and `max_reference_age` (`5s`). All durations must be positive, and the maximum age must exceed both the polling interval and request timeout. Reference age starts when requests start, so network delays consume the freshness budget. Redirects are rejected, responses are bounded, and RPC error bodies and URLs are omitted from diagnostics.
+
+Each account or transaction stream uses its commitment's reference. Slot notifications use their actual status, since both slot subscriptions receive every status; confirmed and finalized statuses use their respective tips, and the other statuses use processed. The inclusive permitted range for new comparisons is reference ± `slot_buffer`, with saturation at integer limits. A peer of an already-open comparison can still arrive after the lower boundary advances, preserving its original deadline; this cannot reopen closed keys and does not bypass reference outages. Validate the default 25-slot allowance against live traffic before publishing results. Rejections are logged as per-provider, per-stream stale/future/reference-unavailable counts once per tick when nonzero. While every connected provider's latest updates on a stream are out of bounds, that stream certifies no coverage: the reference, not the providers, is presumed wrong. An update delayed in the matcher beyond `processing_grace` ends healthy coverage before slot bounds are checked, so a matcher backlog is not counted as a provider's stale update.
+
+Until initial references arrive, and whenever they expire, scoring and healthy coverage stop. Open comparisons affected by an RPC gap are invalidated. Recovery starts a new healthy interval; it does not change provider connection history or count as provider downtime. Each poll keeps the highest tips seen per commitment, so a load-balanced backend slightly behind the last answer does not move the reference backwards. A poll regressing by more than `slot_buffer` on any commitment is refused. Only a successful poll whose processed tip advanced renews freshness, so a stuck backend expires the reference instead of rejecting live slots. The RPC is still trusted for its tip values; it is not an independent proof of ancestry. Choose a reliable reference on the same network as the measured providers.
+
+The validation policy and a hash of the reference RPC URL enter all six configuration IDs. This starts new measurement histories, including when the reference URL changes. The raw URL and credentials are never stored in configuration descriptions. The comparison window, processing grace, connection warmup and slot-confirmation timeout retain their existing meanings.
 
 ## ClickHouse
 

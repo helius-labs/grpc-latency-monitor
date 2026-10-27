@@ -32,8 +32,8 @@ ${providers === null ? '' : `AND ${providers}`}
 
 // Determine outright winners before applying the display filter. A hidden
 // provider remains part of the ideal baseline and can prevent a displayed win.
-// Competitors delivered on time or dropped the event while connected. A win needs
-// two competitors and a unique first on-time delivery: dropping an event loses it
+// Competitors delivered on time or missed the deadline while connected. A win needs
+// two competitors and a unique first on-time delivery: missing an event’s deadline loses it
 // to every provider that delivered it. Uncontested deliveries and ties don't count.
 const providerWins = `WITH event_winners AS (
  SELECT subscription_id, data_type, commitment, event_id, min(event_utc) AS winner_utc,
@@ -52,9 +52,9 @@ const providerWins = `WITH event_winners AS (
 `;
 
 // Conditional aggregates pair providers in one scan and preserve retry deduplication.
-// Every event both providers competed for (on time, or dropped while connected)
+// Every event both providers competed for (on time, or missed the deadline while connected)
 // that at least one delivered. Differences use only events both delivered on time;
-// delivering an event the other provider dropped is a win.
+// delivering an event the other provider missed the deadline for is a win.
 const pairs = `WITH pairs AS (
  SELECT subscription_id, data_type, commitment, event_id,
  minIf(event_utc, provider = \${provider_a:sqlstring}) AS observed_utc,
@@ -94,7 +94,7 @@ const exactPairSummary = pairs + `SELECT * EXCEPT percentiles FROM (SELECT
  countIf(b_win) / nullIf(countIf(a_win OR b_win), 0) * 100 AS b_win_percent
  FROM pairs)`;
 
-// Buckets with only dropped-event wins have no differences: those fields are NULL.
+// Buckets with only missed-deadline wins have no differences: those fields are NULL.
 const exactPairTrends = pairs + `SELECT * EXCEPT percentiles FROM (SELECT $__timeInterval(observed_utc) AS time,
  quantilesExactIf(0.01, 0.05, 0.5, 0.95, 0.99)(difference_ns, both_on_time) AS percentiles,
  if(countIf(both_on_time) > 0, avgIf(difference_ns, both_on_time) / 1e6, NULL) AS avg_a_minus_b_ms,
@@ -139,7 +139,7 @@ const exactProviderWinTrend = providerWins + `SELECT $__timeInterval(event_utc) 
  countIf(is_win) / nullIf(sum(countIf(is_win)) OVER (PARTITION BY time), 0) * 100 AS win_percent
  FROM selected_events GROUP BY time, provider ORDER BY time, provider`;
 
-// Dropped = a connected provider did not deliver within the on-time window, even
+// Missed deadline = a connected provider did not deliver within the on-time window, even
 // if its delivery arrived later. One series per provider; retries are deduplicated.
 const exactPairDroppedRate = perEvent(scope, pairProviders) + `SELECT $__timeInterval(observed_utc) AS time,
  provider AS series, countIf(missed) / $__interval_s AS events_per_second
@@ -226,7 +226,7 @@ export const OUTAGE_SECONDS = 10;
 // the range and summed over streams; shorter ones count only as disconnects. An
 // outage still open at the range end is judged by how long it lasted afterwards
 // (or until now). Events while a provider is disconnected are excluded from
-// comparisons instead of counted as dropped, so downtime is reported here.
+// comparisons instead of counted as missed deadlines, so downtime is reported here.
 // A subscriber restart without a recorded disconnect is not provider downtime, and
 // neither is a disconnect caused by the subscriber's own backlog (reason texts from
 // LOCAL_DISCONNECTS in src/stream.rs); a provider failure while reconnecting is.
@@ -296,7 +296,7 @@ export const pairSummary = route(exactPairSummary, summary(`SELECT ${merged} qs,
  sum(wins) / nullIf(sum(wins) + sum(losses), 0) * 100 a_win_percent,
  sum(losses) / nullIf(sum(wins) + sum(losses), 0) * 100 b_win_percent ${pairRows}`), overview);
 
-// Pair rows also carry dropped-event wins (delivered = 0): no differences there.
+// Pair rows also carry missed-deadline wins (delivered = 0): no differences there.
 export const pairTrends = route(exactPairTrends, summary(`SELECT $__timeInterval(bucket) time, ${merged} qs,
  toFloat64(sum(lag_sum)) / nullIf(sum(delivered), 0) / 1e6 avg_a_minus_b_ms,
  if(sum(delivered) > 0, qs[2] / 1e6, NULL) p1_a_minus_b_ms, if(sum(delivered) > 0, qs[3] / 1e6, NULL) p5_a_minus_b_ms,

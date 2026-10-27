@@ -30,7 +30,7 @@ for region, cloud, version, winner in [
     event(region, cloud, version, 'tie', 13, {'A': 0, 'B': 0})
     # Uncontested (other provider not connected, no row): not a win.
     event(region, cloud, version, 'sole', 14, {'A': 0})
-    # The other provider dropped it while connected: a win for the deliverer.
+    # The other provider missed its deadline while connected: a win for the deliverer.
     event(region, cloud, version, 'dropped', 15, {winner: 0, other: None})
 rows.append(rows[0])  # Ambiguous retry must not create another win or tie.
 # Earlier configuration loses even if it would favor another provider.

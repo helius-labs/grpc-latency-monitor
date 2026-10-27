@@ -85,8 +85,8 @@ pub struct Arrival {
 }
 
 /// Per provider and event. There is one window: a delivery that is not on time
-/// counts as dropped (`Missed`), even if it arrives later. A processed miss in a
-/// slot that never confirmed is `Forked` instead, and is not a drop.
+/// counts as a missed deadline (`Missed`), even if it arrives later. A processed
+/// miss in a slot that never confirmed is `Forked` instead, and is not a missed deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     OnTime,

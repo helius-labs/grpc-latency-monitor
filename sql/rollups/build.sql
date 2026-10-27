@@ -7,14 +7,14 @@
 --   bucket         minute bucket (the worker passes one minute; dashboards derive it per row)
 --   generation     summary generation (0 for the dashboards' raw fallback)
 --
--- Competitors of an event are providers that delivered it on time or dropped it
+-- Competitors of an event are providers that delivered it on time or missed its deadline
 -- (`missed`) while connected. A `forked` miss (its slot never confirmed) is neither.
 -- A provider win needs at least two competitors and one unique first on-time
--- delivery, so a provider that drops an event loses to every provider that
+-- delivery, so a provider that misses an event’s deadline loses to every provider that
 -- delivered it. Pair rows cover both orientations whenever both providers competed
 -- and at least one delivered: differences (`delivered`, lag sum, percentiles) use
--- only events both delivered, while delivering an event the other provider dropped
--- counts as a win.
+-- only events both delivered on time. An on-time delivery counts as a win when
+-- the other provider misses the deadline.
 WITH per_provider AS (
  SELECT region, cloud_provider, subscription_id, data_type, commitment, event_id, provider,
  min(event_utc) first_seen, max(event_utc) last_seen,

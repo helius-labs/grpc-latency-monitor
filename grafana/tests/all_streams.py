@@ -1,5 +1,5 @@
 """All Providers and Head to Head queries: latest-configuration selection, pooled
-streams, wins, drops, downtime and configuration labels.
+streams, wins, missed deadlines, downtime and configuration labels.
 
 Run with: python3 grafana/tests/all_streams.py (needs dashboard dependencies and
 the clickhouse CLI).
@@ -27,7 +27,7 @@ def close(actual, expected):
 # In All, each stream uses its latest configuration: tx-new, ac-new and sl-new.
 assert values('providerLagSummaries', 'p50_lag_ms') == {'A': 0, 'B': 10}
 assert values('providerLagSummaries', 'p99_lag_ms') == {'A': 40, 'B': 30}
-# A wins 3 head-to-head races plus the 'unpaired' event B dropped; B wins 2.
+# A wins 3 head-to-head races plus the 'unpaired' event B missed the deadline for; B wins 2.
 close(values('providerWinSummary', 'win_percent'), {'A': 200/3, 'B': 100/3})
 close(values('providerWinTrend', 'win_percent'), {'A': 200/3, 'B': 100/3})
 assert values('providerMetricsTrend', 'events_per_second') == {'A': 0.7, 'B': 0.6}
@@ -113,7 +113,7 @@ assert values('providerWinSummary', 'win_percent', providers=['C'], setup=hidden
 uncontested = SETUP.replace("'unpaired','B','2026-10-08 00:00:13','missed'", "'unpaired','B','2026-10-08 00:00:13','ignored'")
 assert uncontested != SETUP
 assert values('providerWinSummary', 'win_percent', setup=uncontested) == {'A': 60, 'B': 40}
-# A miss in a slot that never confirmed is `forked`: neither a drop nor a competitor.
+# A miss in a slot that never confirmed is `forked`: neither a missed deadline nor a competitor.
 forked = SETUP.replace("'unpaired','B','2026-10-08 00:00:13','missed'", "'unpaired','B','2026-10-08 00:00:13','forked'")
 assert values('providerWinSummary', 'win_percent', setup=forked) == {'A': 60, 'B': 40}
 assert values('providerMetricsTrend', 'dropped_per_second', setup=forked) == {'A': 0, 'B': 0}
@@ -159,4 +159,4 @@ assert (pair['a_disconnects'], pair['b_disconnects']) == (2, 4), pair
 assert len(run('disconnectedEvents', setup=outage)) > 0
 
 print('All-stream fixtures passed: latest configurations, pooled percentiles and wins, safe event joins, '
-      'rates, throughput, drops, downtime, annotations, history, map pooling, labels and empty ranges.')
+      'rates, throughput, missed deadlines, downtime, annotations, history, map pooling, labels and empty ranges.')

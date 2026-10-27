@@ -8,6 +8,7 @@ use solana_streaming_benchmark::{
     model::{Commitment, DataType, StreamKind},
     pipeline,
     rollups::{self, Worker},
+    slots::{self, Reference},
     storage::{self, BatchLimits},
     stream::{self, InFlight},
     versions,
@@ -101,6 +102,7 @@ fn main() -> Result<()> {
 }
 
 async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
+    let rpc_url = config.slot_validation.rpc_url()?;
     let client = client(&config)?;
     storage::validate_schema(&client).await?;
     let database_key = format!(
@@ -148,7 +150,13 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
         config.subscriber.cloud_provider.clone(),
         config.subscriber.region.clone(),
         config.providers.iter().map(|p| p.name.clone()).collect(),
-        versions::subscription_versions(&config.filters, config.window, &config.providers),
+        versions::subscription_versions(
+            &config.filters,
+            config.window,
+            &config.providers,
+            &config.slot_validation,
+            &rpc_url,
+        ),
         storage_rx,
         BatchLimits {
             max_records: config.batch_size,
@@ -159,6 +167,13 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
     let mut matchers = tokio::task::JoinSet::new();
     let mut stream_readers = tokio::task::JoinSet::new();
     let (stop_matchers, stop) = watch::channel(false);
+    let (reference_tx, reference) = watch::channel(Reference::empty());
+    let mut reference_task = tokio::spawn(slots::run(
+        config.slot_validation.clone(),
+        rpc_url,
+        reference_tx,
+        stop.clone(),
+    ));
     let fates = Arc::new(SlotFates::default());
     for data_type in DataType::ALL {
         for commitment in Commitment::ALL {
@@ -177,6 +192,7 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
                 controls_rx,
                 in_flight.clone(),
                 fates.clone(),
+                reference.clone(),
                 stop.clone(),
                 storage_tx.clone(),
                 pipeline::COVERAGE_INTERVAL,
@@ -214,6 +230,9 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
         result = stream_readers.join_next() => {
             Some(anyhow!("stream reader stopped: {result:?}; coverage unknown"))
         }
+        result = &mut reference_task => {
+            Some(anyhow!("reference RPC task stopped: {result:?}; coverage unknown"))
+        }
     };
     if let Some(error) = &failure {
         tracing::error!("{error:#}; stopping");
@@ -223,6 +242,8 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
     // then exits; no further interval is certified. Dropping their storage senders
     // lets the writer flush every accepted record, on failure too.
     let _ = stop_matchers.send(true);
+    // Polling holds no storage sender and can be cancelled independently.
+    reference_task.abort();
     if let Err(error) = drain_matchers(&mut matchers, MATCHER_STOP_TIMEOUT).await {
         tracing::error!("{error:#}");
         failure.get_or_insert(error);

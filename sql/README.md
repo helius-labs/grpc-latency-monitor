@@ -186,10 +186,10 @@ under the deployment's ClickHouse view security policy. Configuration is unchang
 
 The worker recomputes a complete event-time minute from raw rows. It deduplicates
 provider/event observations and applies the win rules: a win is the first on-time
-delivery among at least two competing providers (delivered or dropped while connected),
+delivery among at least two competing providers (delivered on time or missed the deadline while connected),
 excluding ties. It stores both ordered provider-pair orientations for every event both
-providers competed for: differences use events both delivered, and delivering an event
-the other provider dropped counts as a pair win. It never pairs records within an
+providers competed for: differences use events both delivered on time, and an on-time
+delivery counts as a pair win when the other provider misses the deadline. It never pairs records within an
 individual INSERT block. A new immutable generation becomes visible only after
 its manifest is inserted successfully. Failed builds remain invisible; a retry
 uses a new generation. Every ten minutes the worker deletes generations that are not

@@ -6,7 +6,7 @@
 
 -- HEAD-TO-HEAD: A minus B on the SAME event/region/cloud_provider/subscription;
 -- negative difference means A was faster. Both must be on_time. Dashboard win rates
--- also count an event one provider delivered and the other dropped (missed) as a win.
+-- also count an event one provider delivered on time and the other missed the deadline for as a win.
 WITH delivered AS
 (
     SELECT region, cloud_provider, subscription_id, data_type, commitment, event_id, provider,
@@ -40,7 +40,7 @@ FROM pairs GROUP BY data_type, commitment ORDER BY data_type, commitment;
 
 -- OBSERVED LEADERBOARD (NOT CERTIFIED RELIABILITY): speed is only on-time;
 -- raw miss fraction denominator is on-time + missed. Missing coverage remains unknown.
--- Missed means dropped: not delivered within the on-time window, even if it arrived
+-- Missed means a missed deadline: not delivered within the on-time window, even if it arrived
 -- later.
 WITH per_event AS
 (
@@ -64,7 +64,7 @@ SELECT provider, data_type, commitment,
        quantileExactIf(0.95)(lag_ns, delivered) AS p95_lag_ns
 FROM per_event GROUP BY provider, data_type, commitment ORDER BY data_type, commitment, p50_lag_ns;
 
--- DROPS, CONNECTIVITY, HEALTH: report each separately. Unknown coverage
+-- MISSED DEADLINES, CONNECTIVITY, HEALTH: report each separately. Unknown coverage
 -- applies even if there are no benchmark_measurement_health rows (crash/sink failure might
 -- never reach ClickHouse). These counts are not a certified completeness measure.
 SELECT cloud_provider, region, subscription_id, provider, data_type, commitment,

@@ -189,7 +189,7 @@
       },
       "id": 20,
       "title": "Win rate",
-      "description": "Share of wins within each location: the first on-time delivery of an event that at least two connected providers competed for. Dropping an event loses it. Each row sums to 100%. Green = the location’s leader (ties share it), yellow ≥10%, red <10%.",
+      "description": "Share of wins within each location: the first on-time delivery of an event that at least two connected providers competed for. Missing an event’s deadline loses it. Each row sums to 100%. Green = the location’s leader (ties share it), yellow ≥10%, red <10%.",
       "datasource": {
         "type": "grafana-clickhouse-datasource",
         "uid": "benchmark-clickhouse"
@@ -340,7 +340,7 @@
       },
       "id": 21,
       "title": "p50 lag behind ideal",
-      "description": "Median on-time lag behind each event’s earliest provider arrival at that location. Lower is better; dropped events are excluded.",
+      "description": "Median on-time lag behind each event’s earliest provider arrival at that location. Lower is better; events that missed the deadline are excluded.",
       "datasource": {
         "type": "datasource",
         "uid": "-- Dashboard --"
@@ -489,7 +489,7 @@
       },
       "id": 22,
       "title": "p99 lag behind ideal",
-      "description": "99th percentile on-time lag behind each event’s earliest provider arrival at that location. Lower is better; dropped events are excluded.",
+      "description": "99th percentile on-time lag behind each event’s earliest provider arrival at that location. Lower is better; events that missed the deadline are excluded.",
       "datasource": {
         "type": "datasource",
         "uid": "-- Dashboard --"
@@ -650,8 +650,8 @@
         ]
       },
       "id": 23,
-      "title": "Dropped",
-      "description": "Share of a connected provider’s events not delivered within the configured window after the first provider’s delivery.",
+      "title": "Missed deadline",
+      "description": "Share of a connected provider’s events not delivered within the configured window after the first provider’s delivery, even if delivery arrives later.",
       "datasource": {
         "type": "datasource",
         "uid": "-- Dashboard --"
@@ -800,7 +800,7 @@
       },
       "id": 24,
       "title": "Downtime",
-      "description": "Time each provider’s streams at that location could not reconnect: outages lasting at least 10 s, from a disconnect until the next successful subscription, summed over streams. A shorter interruption, such as a rolling restart that accepts the reconnect right away, counts only as a disconnect. Disconnects caused by the subscriber’s own backlog are excluded. A stalled stream counts only from the moment it is dropped for inactivity (30 s without traffic); events in the stall count as dropped.",
+      "description": "Time each provider’s streams at that location could not reconnect: outages lasting at least 10 s, from a disconnect until the next successful subscription, summed over streams. A shorter interruption, such as a rolling restart that accepts the reconnect right away, counts only as a disconnect. Disconnects caused by the subscriber’s own backlog are excluded. A stalled stream counts only from the moment it is dropped for inactivity (30 s without traffic); events in the stall count as missed deadlines.",
       "datasource": {
         "type": "datasource",
         "uid": "-- Dashboard --"

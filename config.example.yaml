@@ -1,6 +1,12 @@
 # Keep pending-write minute IDs on persistent storage across restarts. Containers
 # must mount this directory. It stores recovery metadata, not measurement rows.
 state_dir: ".benchmark-state"
+# Independent, trusted Solana HTTP(S) RPC. URL may contain credentials; keep it in
+# the environment. Each commitment uses its own getSlot reference.
+slot_validation:
+  rpc_url_env: BENCH_REFERENCE_RPC_URL
+  # Accept slots within +/- this distance of their commitment's reference.
+  slot_buffer: 25
 # Maximum results per ClickHouse insert; inserts also flush at flush_interval, which
 # bounds latency. Large batches keep inserts (and new parts) to about one per second.
 batch_size: 50000
@@ -13,8 +19,8 @@ storage_buffer_capacity: 100000
 matcher_key_capacity: 100000
 flush_interval: "1s"
 # The only comparison window, measured from the first provider's delivery. A provider
-# that has not delivered strictly within it counts as DROPPED (missed), even if its
-# delivery arrives later. Changing it starts a new configuration ID.
+# that has not delivered strictly within it records a missed deadline (`missed`),
+# even if its delivery arrives later. Changing it starts a new configuration ID.
 window: "5s"
 # Matcher queue-drain allowance; does not extend the on-time deadline.
 processing_grace: "2s"
@@ -25,17 +31,17 @@ expired_key_retention: "2m"
 # as keys arrive). Defaults to matcher_key_capacity x ceil(expired_key_retention /
 # (window + processing_grace + 1s)), which covers the whole retention at the rate
 # matcher_key_capacity is sized for: 1,500,000 here. Keys forgotten earlier are
-# still ignored through a slot floor. Optional.
+# still ignored through a slot floor, including after normal expiry. Optional.
 # expired_key_capacity: 1500000
-# After each subscription, a provider cannot count as dropping an event (and healthy
+# After each subscription, a provider cannot record a missed deadline (and healthy
 # coverage does not start) for this long: the server may apply the filter after
 # accepting the subscription. Deliveries still count. Optional; defaults to 1s;
 # "0s" disables it.
 connection_warmup: "1s"
 # A processed account or transaction miss waits until its slot is confirmed (then it
-# counts as dropped) or explicitly dead (then it is recorded as
-# forked: the event was on a fork the provider never replayed, not a drop). Misses
-# still undecided after this long count as forked. Optional; defaults to 30s.
+# counts as a missed deadline) or explicitly dead (then it is recorded as
+# forked: the event was on a fork the provider never replayed, not a missed deadline).
+# Misses still undecided after this long count as forked. Optional; defaults to 30s.
 slot_confirmation_timeout: "30s"
 
 filters:

@@ -1,8 +1,8 @@
 //! A processed account update or transaction on a fork that never confirms is
 //! delivered only by providers that replayed that fork. Counting every other
-//! provider as dropping it would measure fork exposure, not reliability, so a
-//! processed miss waits for its slot's fate: in a confirmed slot it is a drop
-//! (`missed`); in a dead or never-confirmed slot it is recorded as `forked`.
+//! provider as missing its deadline would measure fork exposure, not reliability. A
+//! processed miss waits for its slot's fate: in a confirmed slot it is a missed
+//! deadline (`missed`); in a dead or never-confirmed slot it is recorded as `forked`.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -15,7 +15,7 @@ use yellowstone_grpc_proto::geyser::SlotStatus;
 
 use crate::model::{LagRecord, Outcome, StorageRecord};
 
-/// Slots remembered below the highest finalized slot (about an hour at 400 ms).
+/// Slots remembered below the RPC's finalized reference (about an hour at 400 ms).
 /// A pending miss resolves long before its slot falls out of this range.
 const RETAINED_SLOTS: u64 = 10_000;
 
@@ -48,17 +48,22 @@ impl SlotFates {
             }
             Ok(SlotStatus::SlotFinalized) => {
                 fates.confirmed.insert(slot);
-                if fates.finalized.is_none_or(|finalized| slot > finalized) {
-                    fates.finalized = Some(slot);
-                    let floor = slot.saturating_sub(RETAINED_SLOTS);
-                    fates.confirmed = fates.confirmed.split_off(&floor);
-                    fates.dead = fates.dead.split_off(&floor);
-                }
             }
             Ok(SlotStatus::SlotDead) => {
                 fates.dead.insert(slot);
             }
             _ => {}
+        }
+    }
+
+    /// Only the independent RPC reference can advance the pruning watermark.
+    pub fn prune(&self, finalized: u64) {
+        let mut fates = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if fates.finalized.is_none_or(|old| finalized > old) {
+            fates.finalized = Some(finalized);
+            let floor = finalized.saturating_sub(RETAINED_SLOTS);
+            fates.confirmed = fates.confirmed.split_off(&floor);
+            fates.dead = fates.dead.split_off(&floor);
         }
     }
 
@@ -103,7 +108,7 @@ impl ForkFilter {
 
     /// Pass rows through, holding misses whose slot is undecided, and release held
     /// misses that are now decided. A slot undecided after `timeout` (for example
-    /// while every slot stream is down) counts as forked, not dropped; so do the
+    /// while every slot stream is down) counts as forked, not a missed deadline; so do the
     /// oldest held misses beyond `capacity`.
     pub fn filter(
         &mut self,
@@ -302,6 +307,12 @@ mod tests {
         let fates = SlotFates::default();
         fates.record(5, CONFIRMED);
         fates.record(RETAINED_SLOTS + 10, FINALIZED);
+        assert_eq!(
+            fates.fate(5),
+            Fate::Confirmed,
+            "provider finalization cannot prune"
+        );
+        fates.prune(RETAINED_SLOTS + 10);
         assert_eq!(fates.fate(5), Fate::Unknown);
         assert_eq!(fates.fate(RETAINED_SLOTS + 10), Fate::Confirmed);
         assert_eq!(fates.fate(RETAINED_SLOTS + 11), Fate::Unknown);

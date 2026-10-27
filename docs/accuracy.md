@@ -6,7 +6,7 @@ How much measurement noise the benchmark itself adds, and how to tell a real pro
 
 Three tests, each comparing a source against itself so that the expected difference is zero:
 
-1. **Matcher:** every update from a live subscription is fed to the matching loop twice, as providers A and B with an identical arrival stamp. Any nonzero lag, drop or unpaired event is an error in the matcher.
+1. **Matcher:** every update from a live subscription is fed to the matching loop twice, as providers A and B with an identical arrival stamp. Any nonzero lag, missed deadline or unpaired event is an error in the matcher.
 2. **Reader:** one live subscription per stream is relayed to two independent readers. The difference between their arrival stamps for the same event is the reader's own jitter.
 3. **A/A control in production:** the same provider endpoint is configured twice under two names on a production subscriber, each with its own connection, alongside the other providers. This measures the full end-to-end noise, including how the provider schedules two connections.
 
@@ -18,7 +18,7 @@ An arrival is stamped when the gRPC stream yields a message, after it has been r
 
 ### Test #1: Matcher (2026-10-09)
 
-| Run | Pairs | Nonzero lags | Dropped | Unpaired | Gaps | Disconnects |
+| Run | Pairs | Nonzero lags | Missed deadlines | Unpaired | Gaps | Disconnects |
 |---|---:|---:|---:|---:|---:|---:|
 | 1 (60 s) | 83,751 | 0 | 0 | 0 | 0 | 0 |
 | 2 (60 s) | 73,905 | 0 | 0 | 0 | 0 | 0 |
@@ -38,7 +38,7 @@ Two 60-second runs, **221,315 matched pairs**, absolute difference between the t
 | Slots | Processed | 228 | 0.011 | 0.032 | 0.063 | 0.341 | 0.341 |
 | Slots | Finalized | 228 | 0.014 | 0.051 | 0.200 | 0.754 | 0.754 |
 
-- **Clean runs:** no drops, gaps or disconnects.
+- **Clean runs:** no missed deadlines, gaps or disconnects.
 - **No reader bias:** signed medians were within ±0.01 ms, and reader A won 48–51% of decided pairs.
 - **Finalized transactions are the noisiest:** they arrive in bursts of roughly 280 messages per finalized slot, and draining a burst dominates the tail.
 
@@ -46,7 +46,7 @@ The relay is included in these numbers, so they are upper bounds for reader jitt
 
 ### Test #3: A/A control in production (2026-10-15)
 
-About 36 minutes on a production subscriber. All six streams stayed connected and healthy, with no gaps or reconnects, and both copies dropped exactly the same events. Exact percentiles over every event both copies delivered on time:
+About 36 minutes on a production subscriber. All six streams stayed connected and healthy, with no gaps or reconnects, and both copies missed the deadlines for exactly the same events. Exact percentiles over every event both copies delivered on time:
 
 | Data type | Commitment | Pairs | Signed median | p50 | p95 | p99 | p99.9 | Maximum | A wins |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -63,7 +63,7 @@ The **p50–Maximum** columns are the absolute difference |A − B|; **A wins** 
 - **Win rates near 50% are a tie:** processed streams leaned 51–52% toward the second copy, consistently but by microseconds.
 - **Finalized streams are noisier and unstable over short ranges:** per 6-minute slice, the finalized account win rate ranged from 34.8% to 71.1%.
 - **Rare spikes:** isolated differences reached 141–202 ms on account streams, but p99.9 stayed below 6 ms.
-- **Startup drops:** in the first few milliseconds after a restart, one provider can deliver events the others never send, since each subscription starts at a slightly different point on the chain. These count as drops for the other providers.
+- **Startup missed deadlines:** in the first few milliseconds after a restart, one provider can deliver events the others never send, since each subscription starts at a slightly different point on the chain. These count as missed deadlines for the other providers.
 
 ## How to read head-to-head results
 

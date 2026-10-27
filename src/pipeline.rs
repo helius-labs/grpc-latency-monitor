@@ -20,6 +20,7 @@ use crate::{
         Arrival, Commitment, CoverageRecord, DataType, EventKey, GapRecord, StorageRecord,
         StreamKind,
     },
+    slots::{Reference, Rejection},
     stream::{InFlight, StreamControl},
 };
 
@@ -49,16 +50,33 @@ struct StreamState {
     /// repeating the full scan per arrival would make a backlog quadratic.
     stale_invalidated: bool,
     storage_stalled: bool,
-    /// A recovered storage stall must not restart coverage inside the stall.
+    /// Recovery from storage or reference gaps must not bridge unknown time.
     healthy_after: Option<(Instant, SystemTime)>,
     /// Slot streams record slot statuses; processed account and transaction
     /// streams hold their misses until the slot's fate is known.
     fates: Arc<SlotFates>,
     forks: Option<ForkFilter>,
+    reference: watch::Receiver<Reference>,
+    reference_ready: bool,
+    reference_generation: u64,
+    reference_config: crate::config::SlotValidationConfig,
+    last_finalized_reference: Option<u64>,
+    /// stale, future, reference unavailable; aggregated once per tick.
+    rejections: Vec<[u64; 3]>,
+    /// Per provider: rejected as out of bounds since its last admitted update.
+    /// When every connected provider is, the reference itself is suspect.
+    out_of_bounds: Vec<bool>,
 }
 
 impl StreamState {
-    fn new(kind: StreamKind, count: usize, config: &Config, fates: Arc<SlotFates>) -> Self {
+    fn new(
+        kind: StreamKind,
+        count: usize,
+        config: &Config,
+        fates: Arc<SlotFates>,
+        reference: watch::Receiver<Reference>,
+    ) -> Self {
+        let snapshot = *reference.borrow();
         let forks = (kind.commitment == Commitment::Processed && kind.data_type != DataType::Slot)
             .then(|| {
                 ForkFilter::new(
@@ -82,10 +100,69 @@ impl StreamState {
             connection_warmup: config.connection_warmup,
             stale_invalidated: false,
             storage_stalled: false,
-            healthy_after: None,
+            healthy_after: snapshot.tips.map(|_| snapshot.healthy_since),
             fates,
             forks,
+            reference,
+            reference_ready: snapshot
+                .fresh(Instant::now(), config.slot_validation.max_reference_age),
+            reference_generation: snapshot.generation,
+            reference_config: config.slot_validation.clone(),
+            last_finalized_reference: None,
+            rejections: vec![[0; 3]; count],
+            out_of_bounds: vec![false; count],
         }
+    }
+
+    fn sync_reference(&mut self, now: Instant, utc: SystemTime) -> Vec<StorageRecord> {
+        let snapshot = *self.reference.borrow_and_update();
+        let ready = snapshot.fresh(now, self.reference_config.max_reference_age);
+        let changed = snapshot.generation != self.reference_generation;
+        let mut rows = Vec::new();
+        if (self.reference_ready && !ready) || changed {
+            rows.extend(self.lose_health(None));
+            rows.extend(
+                self.matcher
+                    .invalidate_open(None, now, utc, "RPC slot reference gap"),
+            );
+        }
+        if ready && (!self.reference_ready || changed) {
+            // A coalesced outage/recovery must not bridge an old certificate.
+            let recovered = if snapshot.healthy_since.0 > now {
+                snapshot.healthy_since
+            } else {
+                (now, utc)
+            };
+            if self.healthy_after.is_none_or(|old| recovered.0 > old.0) {
+                self.healthy_after = Some(recovered);
+            }
+        }
+        if !ready {
+            rows.extend(self.lose_health(None));
+        } else if let Some(tips) = snapshot.tips {
+            if self
+                .last_finalized_reference
+                .is_none_or(|old| tips.finalized > old)
+            {
+                self.fates.prune(tips.finalized);
+                self.last_finalized_reference = Some(tips.finalized);
+            }
+        }
+        self.reference_ready = ready;
+        self.reference_generation = snapshot.generation;
+        rows
+    }
+
+    /// A reference that lags or leads the chain rejects every live update; that
+    /// must withhold certification rather than look like a quiet, healthy stream.
+    fn reference_disputed(&self) -> bool {
+        let mut connected = self
+            .connected
+            .iter()
+            .zip(&self.out_of_bounds)
+            .filter(|(connected, _)| **connected)
+            .peekable();
+        connected.peek().is_some() && connected.all(|(_, rejected)| *rejected)
     }
 
     fn coverage_start(&self, at: Instant, utc: SystemTime) -> Coverage {
@@ -147,11 +224,15 @@ impl StreamState {
     /// Close windows whose deadline has passed and release misses whose slot
     /// fate is now known.
     fn close(&mut self, end: Instant, now: Instant) -> Vec<StorageRecord> {
+        // Draining or persisting queued arrivals may have blocked since the tick
+        // captured `now`. Freshness must use the current clock at close itself.
+        let mut out = self.sync_reference(Instant::now(), SystemTime::now());
         let rows = self.matcher.close(end);
-        match &mut self.forks {
+        out.extend(match &mut self.forks {
             Some(forks) => forks.filter(rows, now, &self.fates),
             None => rows,
-        }
+        });
+        out
     }
 
     /// Stop certifying one provider (or all): first write any certified time that
@@ -191,10 +272,11 @@ impl StreamState {
             } => {
                 let mut rows = self.lose_health(Some(provider));
                 self.connected[provider] = true;
+                self.out_of_bounds[provider] = false;
                 // Healthy coverage starts with miss eligibility, after warmup.
-                self.coverage[provider] = Some(
-                    self.coverage_start(at + self.connection_warmup, utc + self.connection_warmup),
-                );
+                self.coverage[provider] = self.reference_ready.then(|| {
+                    self.coverage_start(at + self.connection_warmup, utc + self.connection_warmup)
+                });
                 rows.extend(
                     self.matcher
                         .connection_change(provider, at, utc, true, reason),
@@ -233,12 +315,11 @@ impl StreamState {
     }
 
     fn arrival(&mut self, arrival: Arrival, processing_grace: Duration) -> Vec<StorageRecord> {
-        // A slot's fate is a fact regardless of whether this comparison is complete.
-        if let EventKey::Slot { slot, status } = arrival.key {
-            self.fates.record(slot, status);
-        }
-        let stale = Instant::now().duration_since(arrival.at) > processing_grace;
-        let mut rows = Vec::new();
+        let now = Instant::now();
+        let mut rows = self.sync_reference(now, SystemTime::now());
+        // Queueing delay is checked before slot bounds: a backlog ages slots below
+        // the current tip, and must withhold health instead of blaming the provider.
+        let stale = now.duration_since(arrival.at) > processing_grace;
         if stale {
             rows.extend(self.lose_health(None));
             if !self.stale_invalidated {
@@ -250,6 +331,38 @@ impl StreamState {
                     "processing grace exceeded",
                 ));
             }
+        }
+        let check = self.reference.borrow().check(
+            self.kind,
+            &arrival.key,
+            arrival.at,
+            now,
+            &self.reference_config,
+        );
+        if let Err(reason) = check {
+            // Advancing the RPC tip must not discard an on-time peer of an
+            // already-admitted key and invent a miss at the lower boundary.
+            if reason != Rejection::Stale || !self.matcher.has_open(&arrival.key) {
+                let index = match reason {
+                    Rejection::Stale if stale => return rows,
+                    Rejection::Stale => 0,
+                    Rejection::Future => 1,
+                    Rejection::Unavailable => 2,
+                };
+                self.rejections[arrival.provider][index] =
+                    self.rejections[arrival.provider][index].saturating_add(1);
+                if reason != Rejection::Unavailable {
+                    self.out_of_bounds[arrival.provider] = true;
+                }
+                return rows;
+            }
+        }
+        self.out_of_bounds[arrival.provider] = false;
+        // A slot's fate is a fact regardless of whether this comparison is complete.
+        if let EventKey::Slot { slot, status } = arrival.key {
+            self.fates.record(slot, status);
+        }
+        if stale {
             rows.extend(self.matcher.arrival_incomplete(arrival));
         } else {
             rows.extend(self.matcher.arrival(arrival));
@@ -274,14 +387,17 @@ pub async fn match_stream(
     mut controls: mpsc::Receiver<StreamControl>,
     in_flight: Arc<InFlight>,
     fates: Arc<SlotFates>,
+    reference: watch::Receiver<Reference>,
     mut stop: watch::Receiver<bool>,
     storage: mpsc::Sender<StorageRecord>,
     coverage_every: Duration,
 ) -> Result<()> {
-    let mut state = StreamState::new(kind, count, &config, fates);
+    let mut state = StreamState::new(kind, count, &config, fates, reference);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        let rows = state.sync_reference(Instant::now(), SystemTime::now());
+        state.send_rows(&storage, rows).await?;
         // Drain lifecycle changes before considering arrivals or certification. A reader
         // sends its gap before reconnecting; a drop invalidates the whole pending interval.
         for _ in 0..64 {
@@ -297,6 +413,9 @@ pub async fn match_stream(
                 let rows = state.stop();
                 state.send_rows(&storage, rows).await?;
                 return Ok(());
+            }
+            changed = state.reference.changed() => {
+                changed.context("reference RPC task stopped")?;
             }
             _ = tick.tick() => {
                 let now = Instant::now();
@@ -329,9 +448,22 @@ pub async fn match_stream(
                 let rows = state.close(end, now);
                 state.send_rows(&storage, rows).await?;
                 state.stale_invalidated = false;
+                for (provider, counts) in state.rejections.iter_mut().enumerate() {
+                    let [stale, future, unavailable] = std::mem::take(counts);
+                    if stale > 0 || future > 0 || unavailable > 0 {
+                        tracing::warn!(provider = %config.providers[provider].name,
+                            data_type = kind.data_type.as_str(), commitment = kind.commitment.as_str(),
+                            stale, future, reference_unavailable = unavailable, "slot validation rejected updates");
+                    }
+                }
                 // A full storage queue delays rows but cannot change results; it
                 // only withholds health certification.
-                if stalled || state.storage_stalled || storage.capacity() == 0 {
+                if !state.reference_ready
+                    || state.reference_disputed()
+                    || stalled
+                    || state.storage_stalled
+                    || storage.capacity() == 0
+                {
                     state.storage_stalled = false;
                     let rows = state.lose_health(None);
                     state.send_rows(&storage, rows).await?;
@@ -396,10 +528,559 @@ mod tests {
     use crate::model::Outcome;
     use yellowstone_grpc_proto::geyser::SlotStatus;
 
+    /// A live reference must advance to be renewed.
+    fn advanced(old: &Reference) -> crate::slots::Tips {
+        let mut tips = old.tips.unwrap();
+        tips.processed += 1;
+        tips
+    }
+
+    fn guarded_state(
+        kind: StreamKind,
+        count: usize,
+    ) -> (Config, watch::Sender<Reference>, StreamState) {
+        let mut config = Config::example();
+        config.window = Duration::from_secs(1);
+        config.connection_warmup = Duration::ZERO;
+        let (tx, reference) = watch::channel(Reference::fixture(crate::slots::Tips {
+            processed: 1040,
+            confirmed: 1038,
+            finalized: 1000,
+        }));
+        let state = StreamState::new(kind, count, &config, Arc::default(), reference);
+        (config, tx, state)
+    }
+
+    #[test]
+    fn future_events_never_open_windows_or_poison_slot_fates() {
+        for kind in [
+            test_kind(),
+            StreamKind {
+                data_type: DataType::Transaction,
+                commitment: Commitment::Finalized,
+            },
+        ] {
+            let (config, _tx, mut state) = guarded_state(kind, 2);
+            let at = Instant::now();
+            let utc = SystemTime::now();
+            for provider in 0..2 {
+                state.control(connected(provider, at - Duration::from_secs(1), utc));
+            }
+            let key = if kind.data_type == DataType::Slot {
+                EventKey::Slot {
+                    slot: 1_000_000,
+                    status: SlotStatus::SlotFinalized as i32,
+                }
+            } else {
+                EventKey::Transaction {
+                    slot: 1_000_000,
+                    signature: vec![1],
+                }
+            };
+            assert!(state
+                .arrival(
+                    Arrival {
+                        provider: 0,
+                        key,
+                        at,
+                        utc,
+                        message_bytes: None
+                    },
+                    config.processing_grace
+                )
+                .is_empty());
+            assert_eq!(state.fates.fate(1_000_000), crate::forks::Fate::Unknown);
+            assert_eq!(state.rejections[0], [0, 1, 0]);
+            assert!(state
+                .close(at + Duration::from_secs(2), at + Duration::from_secs(2))
+                .is_empty());
+            // Rejection cannot advance a dedup floor and suppress a genuine event.
+            let live = if kind.data_type == DataType::Slot {
+                EventKey::Slot {
+                    slot: 1000,
+                    status: SlotStatus::SlotFinalized as i32,
+                }
+            } else {
+                EventKey::Transaction {
+                    slot: 1000,
+                    signature: vec![2],
+                }
+            };
+            state.arrival(
+                Arrival {
+                    provider: 0,
+                    key: live,
+                    at,
+                    utc,
+                    message_bytes: None,
+                },
+                config.processing_grace,
+            );
+            let rows = state.close(at + Duration::from_secs(2), at + Duration::from_secs(2));
+            assert!(rows.iter().any(|r| matches!(r, StorageRecord::Lag(l) if l.provider == 1 && l.outcome == Outcome::Missed)));
+        }
+    }
+
+    #[test]
+    fn a_reference_rejecting_every_provider_withholds_certification() {
+        let (config, _tx, mut state) = guarded_state(test_kind(), 2);
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        for provider in 0..2 {
+            state.control(connected(provider, at - Duration::from_secs(1), utc));
+        }
+        let arrival = |provider, slot| Arrival {
+            provider,
+            key: EventKey::Slot { slot, status: 0 },
+            at,
+            utc,
+            message_bytes: None,
+        };
+        // One provider out of bounds is that provider's problem, not the reference's.
+        state.arrival(arrival(0, 2000), config.processing_grace);
+        assert!(!state.reference_disputed());
+        // Every connected provider out of bounds means the reference lags the chain.
+        state.arrival(arrival(1, 2001), config.processing_grace);
+        assert!(state.reference_disputed());
+        assert_eq!(state.rejections, [[0, 1, 0], [0, 1, 0]]);
+        // Any admitted update clears its provider's flag.
+        state.arrival(arrival(1, 1040), config.processing_grace);
+        assert!(!state.reference_disputed());
+    }
+
+    #[test]
+    fn a_matcher_backlog_loses_health_instead_of_blaming_the_provider() {
+        let (config, _tx, mut state) = guarded_state(test_kind(), 2);
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        for provider in 0..2 {
+            state.control(connected(provider, at - Duration::from_secs(60), utc));
+        }
+        assert!(state.coverage.iter().all(Option::is_some));
+        // Delivered on time 20 s ago; its slot is now below the current tip - 25.
+        let delayed = at - Duration::from_secs(20);
+        state.arrival(
+            Arrival {
+                provider: 0,
+                key: EventKey::Slot {
+                    slot: 1000,
+                    status: 0,
+                },
+                at: delayed,
+                utc: utc - Duration::from_secs(20),
+                message_bytes: None,
+            },
+            config.processing_grace,
+        );
+        assert!(state.coverage.iter().all(Option::is_none));
+        assert_eq!(state.rejections[0], [0, 0, 0]);
+        assert!(!state.out_of_bounds[0]);
+    }
+
+    #[test]
+    fn future_finalization_cannot_turn_a_confirmed_miss_into_a_fork() {
+        let (config, tx, mut slots) = guarded_state(test_kind(), 2);
+        let kind = StreamKind {
+            data_type: DataType::Transaction,
+            commitment: Commitment::Processed,
+        };
+        let mut transactions =
+            StreamState::new(kind, 2, &config, slots.fates.clone(), tx.subscribe());
+        let at = Instant::now();
+        let utc = SystemTime::now();
+        for provider in 0..2 {
+            transactions.control(connected(provider, at - Duration::from_secs(1), utc));
+        }
+        let arrival = |key| Arrival {
+            provider: 0,
+            key,
+            at,
+            utc,
+            message_bytes: None,
+        };
+        slots.arrival(
+            arrival(EventKey::Slot {
+                slot: 1038,
+                status: SlotStatus::SlotConfirmed as i32,
+            }),
+            config.processing_grace,
+        );
+        slots.arrival(
+            arrival(EventKey::Slot {
+                slot: 1_000_000,
+                status: SlotStatus::SlotFinalized as i32,
+            }),
+            config.processing_grace,
+        );
+        assert_eq!(slots.fates.fate(1038), crate::forks::Fate::Confirmed);
+        transactions.arrival(
+            arrival(EventKey::Transaction {
+                slot: 1038,
+                signature: vec![1],
+            }),
+            config.processing_grace,
+        );
+        let rows = transactions.close(at + Duration::from_secs(2), at + Duration::from_secs(2));
+        assert!(rows.iter().any(|r| matches!(r, StorageRecord::Lag(l) if l.provider == 1 && l.outcome == Outcome::Missed)));
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Lag(l) if l.outcome == Outcome::Forked)));
+    }
+
+    #[test]
+    fn an_on_time_peer_is_not_lost_when_the_rpc_lower_boundary_advances() {
+        let (config, references, mut state) = guarded_state(test_kind(), 2);
+        let at = Instant::now();
+        let utc = SystemTime::now();
+        for provider in 0..2 {
+            state.control(connected(provider, at - Duration::from_secs(1), utc));
+        }
+        let key = EventKey::Slot {
+            slot: 1015,
+            status: 0,
+        }; // exactly tip - 25
+        state.arrival(
+            Arrival {
+                provider: 0,
+                key: key.clone(),
+                at,
+                utc,
+                message_bytes: None,
+            },
+            config.processing_grace,
+        );
+        let old = *references.borrow();
+        let mut tips = old.tips.unwrap();
+        tips.processed += 1;
+        references.send_replace(
+            old.advance(
+                tips,
+                at,
+                at,
+                utc,
+                config.slot_validation.max_reference_age,
+                config.slot_validation.slot_buffer,
+            )
+            .unwrap(),
+        );
+        state.arrival(
+            Arrival {
+                provider: 1,
+                key,
+                at: at + Duration::from_millis(10),
+                utc,
+                message_bytes: None,
+            },
+            config.processing_grace,
+        );
+        let rows = state.close(at + Duration::from_secs(2), at + Duration::from_secs(2));
+        let outcomes: Vec<_> = rows
+            .iter()
+            .filter_map(|r| match r {
+                StorageRecord::Lag(l) => Some(l.outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes, [Outcome::OnTime, Outcome::OnTime]);
+        // The same old slot cannot open a different comparison.
+        state.arrival(
+            Arrival {
+                provider: 0,
+                key: EventKey::Slot {
+                    slot: 1015,
+                    status: SlotStatus::SlotCreatedBank as i32,
+                },
+                at,
+                utc,
+                message_bytes: None,
+            },
+            config.processing_grace,
+        );
+        assert_eq!(state.rejections[0], [1, 0, 0]);
+        assert!(state
+            .close(at + Duration::from_secs(3), at + Duration::from_secs(3))
+            .is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rpc_expiry_invalidates_open_windows_and_recovery_restarts_coverage() {
+        let (config, tx, mut state) = guarded_state(test_kind(), 2);
+        let at = Instant::now();
+        let utc = SystemTime::now();
+        for provider in 0..2 {
+            state.control(connected(provider, at - Duration::from_secs(1), utc));
+        }
+        state.arrival(
+            Arrival {
+                provider: 0,
+                key: EventKey::Slot {
+                    slot: 1040,
+                    status: 0,
+                },
+                at,
+                utc,
+                message_bytes: None,
+            },
+            config.processing_grace,
+        );
+        tokio::time::advance(config.slot_validation.max_reference_age).await;
+        // Closing uses actual reference age even when the tick's drain was slow.
+        let tick = at + Duration::from_secs(2);
+        let rows = state.close(tick, tick);
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Gap(g) if g.reason == "RPC slot reference gap")));
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Lag(_) | StorageRecord::Connection(_))));
+        assert!(state.coverage.iter().all(Option::is_none));
+        assert!(!state.reference_ready);
+        let old = *tx.borrow();
+        let recovered = old
+            .advance(
+                advanced(&old),
+                Instant::now(),
+                Instant::now(),
+                SystemTime::now(),
+                config.slot_validation.max_reference_age,
+                config.slot_validation.slot_buffer,
+            )
+            .unwrap();
+        tx.send_replace(recovered);
+        state.sync_reference(Instant::now(), SystemTime::now());
+        assert!(state.reference_ready);
+        let coverage = state.coverage_start(at, utc);
+        assert!(coverage.start >= recovered.healthy_since.0);
+        // Work stamped during the gap cannot be admitted after recovery.
+        state.arrival(
+            Arrival {
+                provider: 0,
+                key: EventKey::Slot {
+                    slot: 1041,
+                    status: 0,
+                },
+                at,
+                utc,
+                message_bytes: None,
+            },
+            Duration::MAX,
+        );
+        assert_eq!(state.rejections[0], [0, 0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_coalesced_rpc_outage_cannot_bridge_certified_coverage() {
+        let (config, tx, mut state) = guarded_state(test_kind(), 2);
+        let at = Instant::now();
+        let utc = SystemTime::now();
+        for provider in 0..2 {
+            state.control(connected(provider, at, utc));
+        }
+        state.arrival(
+            Arrival {
+                provider: 0,
+                key: EventKey::Slot {
+                    slot: 1040,
+                    status: 0,
+                },
+                at,
+                utc,
+                message_bytes: None,
+            },
+            config.processing_grace,
+        );
+        // The poller recovers before this busy matcher observes expiry.
+        tokio::time::advance(config.slot_validation.max_reference_age + Duration::from_secs(1))
+            .await;
+        let old = *tx.borrow();
+        tx.send_replace(
+            old.advance(
+                advanced(&old),
+                Instant::now(),
+                Instant::now(),
+                SystemTime::now(),
+                config.slot_validation.max_reference_age,
+                config.slot_validation.slot_buffer,
+            )
+            .unwrap(),
+        );
+        let rows = state.close(Instant::now(), Instant::now());
+        assert!(state.reference_ready);
+        assert!(state.coverage.iter().all(Option::is_none));
+        assert!(rows.iter().any(|r| matches!(r, StorageRecord::Gap(_))));
+        assert!(!rows.iter().any(|r| matches!(r, StorageRecord::Lag(_))));
+    }
+
+    #[test]
+    fn startup_without_an_rpc_reference_cannot_score_or_certify() {
+        let config = Config::example();
+        let (_tx, reference) = watch::channel(Reference::empty());
+        let mut state = StreamState::new(test_kind(), 2, &config, Arc::default(), reference);
+        let at = Instant::now();
+        let utc = SystemTime::now();
+        for provider in 0..2 {
+            state.control(connected(provider, at, utc));
+        }
+        state.arrival(
+            Arrival {
+                provider: 0,
+                key: EventKey::Slot {
+                    slot: 1000,
+                    status: 0,
+                },
+                at,
+                utc,
+                message_bytes: None,
+            },
+            config.processing_grace,
+        );
+        assert!(!state.reference_ready);
+        assert!(state.coverage.iter().all(Option::is_none));
+        assert!(state
+            .close(at + config.window, at + config.window)
+            .is_empty());
+        assert_eq!(state.fates.fate(1000), crate::forks::Fate::Unknown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reference_expiry_and_recovery_work_through_the_running_pipeline() {
+        let (mut config, references, _) = guarded_state(test_kind(), 2);
+        config.processing_grace = Duration::from_millis(10);
+        let (arrivals_tx, arrivals) = mpsc::channel(8);
+        let (controls_tx, controls) = mpsc::channel(8);
+        let (storage, mut rows) = mpsc::channel(128);
+        let (stop, shutdown) = watch::channel(false);
+        let at = Instant::now();
+        let utc = SystemTime::now();
+        for provider in 0..2 {
+            controls_tx
+                .try_send(connected(
+                    provider,
+                    at - Duration::from_secs(1),
+                    utc - Duration::from_secs(1),
+                ))
+                .unwrap();
+        }
+        let task = tokio::spawn(super::match_stream(
+            test_kind(),
+            2,
+            config.clone(),
+            arrivals,
+            controls,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            references.subscribe(),
+            shutdown,
+            storage,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await;
+        while rows.try_recv().is_ok() {}
+        tokio::time::advance(Duration::from_millis(4500)).await;
+        tokio::task::yield_now().await;
+        while rows.try_recv().is_ok() {}
+        let arrival = |slot| Arrival {
+            provider: 0,
+            key: EventKey::Slot { slot, status: 0 },
+            at: Instant::now(),
+            utc: SystemTime::now(),
+            message_bytes: None,
+        };
+        arrivals_tx.try_send(arrival(1040)).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        tokio::task::yield_now().await;
+        let expired: Vec<_> = std::iter::from_fn(|| rows.try_recv().ok()).collect();
+        assert!(expired
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Gap(g) if g.reason == "RPC slot reference gap")));
+        assert!(!expired.iter().any(|r| matches!(
+            r,
+            StorageRecord::Lag(_) | StorageRecord::Coverage(_) | StorageRecord::Connection(_)
+        )));
+        let old = *references.borrow();
+        references.send_replace(
+            old.advance(
+                advanced(&old),
+                Instant::now(),
+                Instant::now(),
+                SystemTime::now(),
+                config.slot_validation.max_reference_age,
+                config.slot_validation.slot_buffer,
+            )
+            .unwrap(),
+        );
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        arrivals_tx.try_send(arrival(1041)).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        let recovered: Vec<_> = std::iter::from_fn(|| rows.try_recv().ok()).collect();
+        assert!(recovered.iter().any(|r| matches!(r, StorageRecord::Lag(l) if l.key.slot() == 1041 && l.provider == 1 && l.outcome == Outcome::Missed)));
+        assert!(!recovered
+            .iter()
+            .any(|r| matches!(r, StorageRecord::Connection(_))));
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    // Existing pipeline fixtures exercise scheduling, not admission bounds.
+    fn fixture_reference(
+        config: &mut Config,
+    ) -> (watch::Sender<Reference>, watch::Receiver<Reference>) {
+        config.slot_validation.slot_buffer = u64::MAX;
+        config.slot_validation.max_reference_age = Duration::from_secs(86400);
+        watch::channel(Reference::fixture(crate::slots::Tips {
+            processed: 1000,
+            confirmed: 1000,
+            finalized: 1000,
+        }))
+    }
+
+    fn test_state(
+        kind: StreamKind,
+        count: usize,
+        config: &Config,
+        fates: Arc<SlotFates>,
+    ) -> StreamState {
+        let mut config = config.clone();
+        let (_tx, reference) = fixture_reference(&mut config);
+        StreamState::new(kind, count, &config, fates, reference)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn match_stream(
+        kind: StreamKind,
+        count: usize,
+        mut config: Config,
+        arrivals: mpsc::Receiver<Arrival>,
+        controls: mpsc::Receiver<StreamControl>,
+        in_flight: Arc<InFlight>,
+        fates: Arc<SlotFates>,
+        stop: watch::Receiver<bool>,
+        storage: mpsc::Sender<StorageRecord>,
+        coverage_every: Duration,
+    ) -> Result<()> {
+        let (_tx, reference) = fixture_reference(&mut config);
+        super::match_stream(
+            kind,
+            count,
+            config,
+            arrivals,
+            controls,
+            in_flight,
+            fates,
+            reference,
+            stop,
+            storage,
+            coverage_every,
+        )
+        .await
+    }
+
     #[tokio::test(start_paused = true)]
     async fn storage_stall_breaks_coverage_even_when_capacity_recovers_before_tick() {
         let config = Config::example();
-        let mut state = StreamState::new(test_kind(), 2, &config, Arc::default());
+        let mut state = test_state(test_kind(), 2, &config, Arc::default());
         let at = Instant::now() - Duration::from_secs(20);
         let utc = SystemTime::now() - Duration::from_secs(20);
         for provider in 0..2 {
@@ -1071,7 +1752,7 @@ mod tests {
     #[test]
     fn provider_gap_withdraws_every_providers_health() {
         let config = Config::example();
-        let mut state = StreamState::new(test_kind(), 2, &config, Arc::default());
+        let mut state = test_state(test_kind(), 2, &config, Arc::default());
         let (at, utc) = (Instant::now(), SystemTime::now());
         for provider in 0..2 {
             state.control(connected(provider, at, utc));
@@ -1100,7 +1781,7 @@ mod tests {
     fn coverage_starts_after_connection_warmup() {
         let mut config = Config::example();
         config.connection_warmup = Duration::from_millis(1500);
-        let mut state = StreamState::new(test_kind(), 1, &config, Arc::default());
+        let mut state = test_state(test_kind(), 1, &config, Arc::default());
         let (at, utc) = (Instant::now(), SystemTime::now());
         state.control(connected(0, at, utc));
         let coverage = state.coverage[0].expect("coverage started");
@@ -1121,8 +1802,8 @@ mod tests {
             data_type,
             commitment: Commitment::Processed,
         };
-        let mut txs = StreamState::new(kind(DataType::Transaction), 2, &config, fates.clone());
-        let mut slots = StreamState::new(kind(DataType::Slot), 2, &config, fates);
+        let mut txs = test_state(kind(DataType::Transaction), 2, &config, fates.clone());
+        let mut slots = test_state(kind(DataType::Slot), 2, &config, fates);
         let (at, utc) = (Instant::now(), SystemTime::now());
         for provider in 0..2 {
             txs.matcher

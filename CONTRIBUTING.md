@@ -5,7 +5,7 @@ Thanks for helping improve the benchmark. Issues and pull requests are welcome.
 ## Before you start
 
 For anything beyond a small fix, open an issue first so we can agree on the
-approach. Changes to what is measured, or how (matching, drops, wins, coverage),
+approach. Changes to what is measured, or how (matching, missed deadlines, wins, coverage),
 change the meaning of published results: explain the reason and the effect on
 existing data in the issue.
 
@@ -43,7 +43,7 @@ own `benchmark_rollup_test_*` database. With `docker compose up`, use
 | Path | Contents |
 | --- | --- |
 | `src/stream.rs` | Yellowstone subscriptions: connect, stamp, decode, enqueue |
-| `src/pipeline.rs`, `src/matcher.rs`, `src/forks.rs` | Per-stream matching, drops and certified coverage |
+| `src/pipeline.rs`, `src/matcher.rs`, `src/forks.rs` | Per-stream matching, missed deadlines and certified coverage |
 | `src/storage.rs`, `src/rollups.rs` | ClickHouse writer and minute summaries |
 | `sql/migrations/` | Schema (Goose migrations) |
 | `sql/rollups/` | Summary SQL, shared by the subscriber, the dashboards and the tests |

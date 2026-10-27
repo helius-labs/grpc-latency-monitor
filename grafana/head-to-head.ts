@@ -23,8 +23,8 @@ headToHeadDashboard
   .withPanel(note([
     '**Resolution:** ten-second detail for the latest six hours; minute summaries for longer or older views. Overview percentiles are exact up to one hour and approximate for longer views. Counts and wins stay exact. Ranges older than six hours are widened to whole minutes at their edges (raw detail has expired). Summary, connection and health history retain 30 days.',
     'Compare **${provider_a} (A)** and **${provider_b} (B)** for the same region, cloud provider and subscription. We compare **the same event delivered on time by both providers**. **All** pools account, transaction and slot events, using the latest configuration per stream.',
-    '**Dropped = not delivered within the configured window.** Each event opens the configured comparison window at the first provider’s delivery. A connected provider that has not delivered by then counts as **dropped** for that event, even if its delivery arrives later. Dropped events are not part of the differences, but they count in win rates: delivering an event the other provider dropped is a win.',
-    `**Downtime:** events while a provider is disconnected are excluded from the comparison, not counted as dropped. The **downtime** cards show outages of at least ${sql.OUTAGE_SECONDS} s, when reconnecting kept failing; quicker reconnects are not downtime.`,
+    '**Missed deadline = not delivered within the configured window.** Each event opens the configured comparison window at the first provider’s delivery. A connected provider that has not delivered by then records a **missed deadline** for that event, even if its delivery arrives later. Events that missed the deadline are not part of the differences, but they count in win rates: delivering on time when the other provider misses the deadline is a win.',
+    `**Downtime:** events while a provider is disconnected are excluded from the comparison, not counted as missed deadlines. The **downtime** cards show outages of at least ${sql.OUTAGE_SECONDS} s, when reconnecting kept failing; quicker reconnects are not downtime.`,
     'The difference is **${provider_a} arrival time − ${provider_b} arrival time**, in milliseconds. **Negative** means ${provider_a} arrived earlier; **positive** means ${provider_b} arrived earlier.',
     'Sort these signed differences from smallest to largest: **p5** is the 5th percentile, **p50** is the median (half the differences are below it, half above), and **p95** is the 95th percentile. **p0.1** is the 0.1st percentile. These describe arrival differences, not a provider’s win rate.',
     '**Illustrative examples (not live readings):**\n\n- **p5 = −10 ms:** for roughly 5% of paired events, ${provider_a} arrived at least 10 ms before ${provider_b}.\n- **p95 = +20 ms:** roughly 95% of differences are at or below +20 ms; the remaining 5% are events where ${provider_a} arrived more than 20 ms after ${provider_b}.',
@@ -42,13 +42,13 @@ headToHeadDashboard
   .withPanel(referenceLine(trend(4, 'Provider win rates', null, 0, 22, 'percent'), 50)
     .gridPos({ x: 0, y: 22, w: 12, h: 8 })
     .axisSoftMin(0).axisSoftMax(100)
-    .description('Provider wins / (${provider_a} wins + ${provider_b} wins), per bucket. A win is the faster on-time delivery, or delivering an event the other provider dropped. Ties excluded; dashed line = 50%.')
+    .description('Provider wins / (${provider_a} wins + ${provider_b} wins), per bucket. A win is the faster on-time delivery, or an on-time delivery when the other provider misses the deadline. Ties excluded; dashed line = 50%.')
     .overrideByName('a_win_percent', [{ id: 'displayName', value: '${provider_a}' }])
     .overrideByName('b_win_percent', [{ id: 'displayName', value: '${provider_b}' }]))
-  .withPanel(trend(6, 'Dropped events per second (not delivered within the configured window)', sql.pairDroppedRate, 12, 22, 'ops')
+  .withPanel(trend(6, 'Missed deadlines per second', sql.pairDroppedRate, 12, 22, 'ops')
     .gridPos({ x: 12, y: 22, w: 12, h: 8 })
     .axisSoftMin(0)
-    .description('Events each provider did not deliver within the configured window after the first provider’s delivery while connected, per second, including unpaired events. Deliveries after that window still count as dropped. Gaps mean no observations.')
+    .description('Events each provider did not deliver within the configured window after the first provider’s delivery while connected, per second, including unpaired events. Deliveries after that window still count as missed deadlines. Gaps mean no observations.')
     .displayName('${__field.labels.series}'));
 
 const cards = [
@@ -66,7 +66,7 @@ const cards = [
 for (const [index, card] of cards.entries()) {
   const panel = new Stat().id(20 + index).title('').displayName(card.title)
     .description(card.winRate
-      ? 'Provider wins / (${provider_a} wins + ${provider_b} wins). A win is the faster on-time delivery, or delivering an event the other provider dropped. Ties excluded. Green >50%, red <50%, gray =50%.'
+      ? 'Provider wins / (${provider_a} wins + ${provider_b} wins). A win is the faster on-time delivery, or an on-time delivery when the other provider misses the deadline. Ties excluded. Green >50%, red <50%, gray =50%.'
       : 'Paired on-time arrival difference (${provider_a} − ${provider_b}), over the selected range. Negative: ${provider_a} faster. Positive: ${provider_b} faster.')
     .datasource(datasource).gridPos({ x: card.x, y: card.y, w: card.w, h: 4 })
     .unit(card.winRate ? 'percent' : 'ms').decimals(2).noValue('No data')
@@ -91,10 +91,10 @@ for (const [index, card] of cards.entries()) {
 }
 
 // Downtime cards share one query; events while disconnected are excluded from the
-// comparison rather than counted as dropped, so their cost is shown here.
+// comparison rather than counted as missed deadlines, so their cost is shown here.
 for (const [index, side] of (['a', 'b'] as const).entries()) {
   const panel = new Stat().id(30 + index).title('').displayName(`\${provider_${side}} downtime`)
-    .description(`Time this provider’s selected streams could not reconnect: outages lasting at least ${sql.OUTAGE_SECONDS} s, from a disconnect until the next successful subscription, summed over streams. Shorter interruptions, such as a rolling restart that accepts the reconnect right away, are not downtime. Disconnects caused by the subscriber’s own backlog are excluded. Events while disconnected are excluded from the comparison, not counted as dropped.`)
+    .description(`Time this provider’s selected streams could not reconnect: outages lasting at least ${sql.OUTAGE_SECONDS} s, from a disconnect until the next successful subscription, summed over streams. Shorter interruptions, such as a rolling restart that accepts the reconnect right away, are not downtime. Disconnects caused by the subscriber’s own backlog are excluded. Events while disconnected are excluded from the comparison, not counted as missed deadlines.`)
     .datasource(datasource).gridPos({ x: 4 + index * 4, y: 8, w: 4, h: 4 })
     .unit('s').decimals(1).noValue('No data')
     .graphMode(BigValueGraphMode.None).colorMode(BigValueColorMode.Value)

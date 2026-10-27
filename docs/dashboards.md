@@ -5,12 +5,12 @@ Three dashboards are defined with the **Grafana Foundation SDK**, sharing builde
 **Definitions used across dashboards:**
 
 - **Ideal provider:** the first observed arrival for each event across all configured providers. Lag is milliseconds behind it, not chain-to-client latency.
-- **Dropped:** not delivered within the configured comparison window after the first provider's delivery. The example window is five seconds; the selected configuration's label shows its actual window.
-- **Win:** the first on-time delivery of an event that at least two connected providers competed for. A provider that drops an event loses it to every provider that delivered it. First-place ties and uncontested deliveries are excluded; win shares divide wins by the selected providers' combined wins.
-- **Downtime:** outages only, i.e. disconnected periods of at least 10 seconds in which reconnecting kept failing, counted in full. The threshold is `OUTAGE_SECONDS` in [`grafana/queries.ts`](../grafana/queries.ts). Events while a provider is disconnected are excluded from its comparisons rather than counted as dropped.
+- **Missed deadline:** not delivered within the configured comparison window after the first provider's delivery. Later delivery still counts as a missed deadline; this does not establish that the event was never delivered. The example window is five seconds; the selected configuration's label shows its actual window.
+- **Win:** the first on-time delivery of an event that at least two connected providers competed for. A provider that misses an event’s deadline loses it to every provider that delivered it. First-place ties and uncontested deliveries are excluded; win shares divide wins by the selected providers' combined wins.
+- **Downtime:** outages only, i.e. disconnected periods of at least 10 seconds in which reconnecting kept failing, counted in full. The threshold is `OUTAGE_SECONDS` in [`grafana/queries.ts`](../grafana/queries.ts). Events while a provider is disconnected are excluded from its comparisons rather than counted as missed deadlines.
 - **Disconnects:** every interruption, including quick reconnects such as a rolling restart behind one endpoint.
 - Disconnects caused by the subscriber's own backlog (`arrival queue full`, `control queue full`) are not provider downtime and are excluded.
-- Dropped counts are raw observations. An empty dropped plot means no matching rows in the selected range, not certified zero loss.
+- Missed deadline counts are raw observations. An empty missed deadline plot means no matching rows in the selected range, not certified zero missed deadlines.
 - Minutes with unmatched raw-write counts are unknown and excluded from event metrics on both the summary and raw paths, including after a subscriber restart. Connection reporting remains available.
 
 ## All Providers
@@ -18,7 +18,7 @@ Three dashboards are defined with the **Grafana Foundation SDK**, sharing builde
 UID `solana-streaming-benchmark`. Source: [`grafana/providers.ts`](../grafana/providers.ts); JSON: [`grafana/solana-streaming-benchmark.json`](../grafana/solana-streaming-benchmark.json).
 
 - Overview bars for win share and p50/p99 lag behind the ideal provider, plus **Downtime** and **Disconnects** bars.
-- p50/p95/p99/p99.9 lag trends, win-share trends, observed event rate, dropped event rate and message throughput. Throughput uses the same deduplicated on-time events as the event-rate chart.
+- p50/p95/p99/p99.9 lag trends, win-share trends, observed event rate, missed deadline rate and message throughput. Throughput uses the same deduplicated on-time events as the event-rate chart.
 - Shows every provider by default, with an optional Providers filter.
 
 ## Head to Head
@@ -28,10 +28,10 @@ UID `solana-streaming-head-to-head`. Source: [`grafana/head-to-head.ts`](../graf
 Compares two different providers, A and B. Negative A − B means A arrived earlier on the same event.
 
 - Cards for p0.1/p1/p5/p50/p95/p99/p99.9 and average arrival difference over the selected range, both providers' win rates, and each provider's downtime.
-- Graphs of average and p1/p5/p50/p95/p99 differences over time, win shares and dropped event rates.
+- Graphs of average and p1/p5/p50/p95/p99 differences over time, win shares and missed deadline rates.
 - Difference panels use only events delivered on time by both providers, including tied arrivals; they show "No data" when there are no eligible pairs.
-- Win rates also count an event one provider delivered and the other dropped as a win for the deliverer. Ties are excluded, so the two rates sum to 100% whenever there is at least one win; with no wins they show "No data", and graph buckets with only ties remain gaps.
-- The dropped-events graph includes unpaired events.
+- Win rates also count an on-time delivery as a win when the other provider misses the deadline. Ties are excluded, so the two rates sum to 100% whenever there is at least one win; with no wins they show "No data", and graph buckets with only ties remain gaps.
+- The missed deadline graph includes unpaired events.
 
 ## Overview
 
@@ -40,7 +40,7 @@ UID `solana-streaming-overview`. Source: [`grafana/overview.ts`](../grafana/over
 One heat map per metric, with a row per location (region, plus cloud provider where a region has several) and a column per provider, for comparing providers across regions at a glance.
 
 - **Performance** tab: win rate and p50/p99 lag behind the ideal provider.
-- **Reliability** tab: dropped events, downtime and disconnects, measured as on All Providers.
+- **Reliability** tab: missed deadlines, downtime and disconnects, measured as on All Providers.
 - Providers are compared only within a location; a provider not running at a location shows `—`.
 - Reads only committed [minute summaries](../sql/README.md#hybrid-dashboard-summaries), so it stays fast over long ranges but does not show the newest, still-open minute.
 - Defaults to the last hour, refreshes every minute; select stream and commitment.

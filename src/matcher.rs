@@ -38,9 +38,9 @@ struct Event {
 /// Closed or rejected keys, remembered as 64-bit digests so a late or repeated
 /// delivery cannot start a new comparison window. Without this, a provider
 /// arriving after the window would become the "first" arrival (lag 0) and every
-/// provider that delivered on time would be recorded as missed.
+/// provider that delivered on time would be recorded as missing the deadline.
 /// Memory is bounded: the oldest entries are evicted beyond `capacity`. A digest
-/// evicted before its retention raises a slot floor instead, and keys at or
+/// forgotten for any reason raises a slot floor instead, and keys at or
 /// below the floor are treated as remembered: they are at least as old as the
 /// eviction horizon, so they cannot be a trustworthy first arrival.
 struct ExpiredKeys {
@@ -48,7 +48,7 @@ struct ExpiredKeys {
     capacity: usize,
     forget_at: HashMap<u64, Instant>,
     order: VecDeque<(Instant, u64, SlotFloor)>,
-    /// Highest slot evicted before its retention, per floor class.
+    /// Highest slot forgotten, per floor class. Survives normal digest expiry.
     floors: HashMap<FloorClass, u64>,
 }
 
@@ -71,9 +71,9 @@ impl ExpiredKeys {
             || self.floors.get(&class).is_some_and(|floor| slot <= *floor)
     }
 
-    fn insert(&mut self, digest: u64, floor: SlotFloor, until: Instant, now: Instant) {
+    fn insert(&mut self, digest: u64, floor: SlotFloor, until: Instant) {
         while self.order.len() >= self.capacity {
-            self.pop_oldest(now);
+            self.pop_oldest();
         }
         let forget_at = self.forget_at.entry(digest).or_insert(until);
         *forget_at = (*forget_at).max(until);
@@ -82,20 +82,18 @@ impl ExpiredKeys {
 
     fn prune(&mut self, now: Instant) {
         while self.order.front().is_some_and(|(until, ..)| *until < now) {
-            self.pop_oldest(now);
+            self.pop_oldest();
         }
     }
 
-    fn pop_oldest(&mut self, now: Instant) {
+    fn pop_oldest(&mut self) {
         if let Some((until, digest, (class, slot))) = self.order.pop_front() {
             // A later insertion of the same digest extends its retention.
             if self.forget_at.get(&digest).is_some_and(|at| *at <= until) {
                 self.forget_at.remove(&digest);
-                if until >= now {
-                    // Forgotten early: keep rejecting this key through the floor.
-                    let floor = self.floors.entry(class).or_insert(slot);
-                    *floor = (*floor).max(slot);
-                }
+                // Normal expiry must not allow an old replay to become first again.
+                let floor = self.floors.entry(class).or_insert(slot);
+                *floor = (*floor).max(slot);
             }
         }
     }
@@ -111,16 +109,16 @@ fn digest(key: &EventKey) -> u64 {
 /// Matches one `StreamKind` across `provider_count` provider indices (0..count).
 ///
 /// `window` is half-open and starts at the first provider's delivery: arrivals
-/// strictly before the deadline are on time. Anything later counts as dropped:
-/// an eligible provider without an on-time arrival is recorded as missed, even
+/// strictly before the deadline are on time. Anything later misses the deadline:
+/// an eligible provider without an on-time arrival is recorded as missing the deadline, even
 /// if its delivery arrives afterwards. There is no separate late outcome.
 ///
 /// When its window closes, a key is classified and removed; its digest is then
 /// remembered for `expired_key_retention` so later deliveries of the key are
 /// ignored instead of starting a new window. The digests are bounded by
 /// `expired_key_capacity` entries; beyond that, the oldest are replaced by a
-/// per-stream slot floor, so a key at or below the highest slot forgotten early
-/// is ignored too. A key can only be admitted again after it is forgotten.
+/// per-stream slot floor, so a key at or below the highest slot forgotten
+/// is ignored too. Closed keys cannot be admitted again in this process.
 /// `max_tracked_keys` caps open windows. If the cap is reached, a new key is
 /// discarded and remembered like a closed key, so a later delivery cannot take
 /// its place; one gap per `close` interval marks the incomplete period.
@@ -138,7 +136,7 @@ pub struct Matcher {
     /// A provider qualifies for misses only this long after subscribing. A
     /// subscription is accepted before the server applies its filter, and events
     /// from just before it may still be delivered first by a slower provider; the
-    /// new subscriber can never send those, so counting them would be false drops.
+    /// new subscriber can never send those, so counting them would be false missed deadlines.
     connection_warmup: Duration,
     max_tracked_keys: usize,
     providers: Vec<ProviderState>,
@@ -197,6 +195,12 @@ impl Matcher {
         self.observe(arrival, false)
     }
 
+    /// A valid comparison can finish while its slot ages below admission bounds.
+    /// This never permits opening a new window or replaying a closed comparison.
+    pub(crate) fn has_open(&self, key: &EventKey) -> bool {
+        self.events.contains_key(key)
+    }
+
     /// A stamp delayed beyond processing grace cannot establish a trustworthy
     /// first arrival, even when it is the first input seen for a new key.
     pub fn arrival_incomplete(&mut self, arrival: Arrival) -> Vec<StorageRecord> {
@@ -221,14 +225,14 @@ impl Matcher {
             let floor = slot_floor(&key);
             if self.expired.contains(digest, floor) {
                 // After its window (or a repeat): already classified as
-                // dropped for this provider. Never start a new first arrival.
+                // a missed deadline for this provider. Never start a new first arrival.
                 return records;
             }
             if self.events.len() == self.max_tracked_keys {
                 // Remember the dropped key: a later delivery of it must not
                 // become the first arrival. Other keys' windows are unaffected.
                 let until = at + self.window + self.expired.retention;
-                self.expired.insert(digest, floor, until, at);
+                self.expired.insert(digest, floor, until);
                 if !self.overloaded {
                     self.overloaded = true;
                     records.push(StorageRecord::Gap(GapRecord {
@@ -425,7 +429,7 @@ impl Matcher {
             }
             if !event.incomplete {
                 for (provider, observation) in event.observations.iter().enumerate() {
-                    // A stamp at or after the deadline is dropped by definition;
+                    // A stamp at or after the deadline misses the deadline by definition;
                     // an earlier out-of-order stamp can move the deadline before it.
                     let on_time = observation.arrived.filter(|stamp| *stamp < event.deadline);
                     if on_time.is_some() || observation.eligible {
@@ -445,7 +449,7 @@ impl Matcher {
                     }
                 }
             }
-            expired.insert(digest(key), slot_floor(key), now + expired.retention, now);
+            expired.insert(digest(key), slot_floor(key), now + expired.retention);
             false
         });
         records
@@ -571,7 +575,7 @@ mod tests {
                     (2, Outcome::Missed, None)
                 ]
             );
-            // A delivery after the window is dropped: no row, no size.
+            // A delivery after the window misses the deadline: no row, no size.
             assert!(m
                 .arrival(Arrival {
                     provider: 2,
@@ -876,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_keys_are_forgotten_after_retention() {
+    fn normal_expiry_reclaims_digests_but_never_reopens_an_old_key() {
         let t = Instant::now();
         let mut m = matcher(2, 4);
         connect_all(&mut m, 2, t);
@@ -884,12 +888,15 @@ mod tests {
         m.close(t + Duration::from_secs(4)); // closes at t + 1s
         let forgotten = t + Duration::from_secs(4) + RETENTION + Duration::from_secs(1);
         m.close(forgotten);
+        assert!(m.expired.forget_at.is_empty());
         m.arrival(arrival(1, 1, forgotten));
-        assert_eq!(
-            m.events.len(),
-            1,
-            "retention bounds memory, not correctness"
+        assert!(
+            m.events.is_empty(),
+            "a late replay cannot invent a new win or miss"
         );
+        assert!(m.close(forgotten + Duration::from_secs(5)).is_empty());
+        m.arrival(arrival(1, 2, forgotten));
+        assert_eq!(m.events.len(), 1, "newer slots are still admitted");
     }
 
     #[test]

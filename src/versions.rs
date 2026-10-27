@@ -5,7 +5,7 @@ use std::time::Duration;
 use prost::Message;
 
 use crate::{
-    config::{FiltersConfig, ProviderConfig},
+    config::{FiltersConfig, ProviderConfig, SlotValidationConfig},
     model::{Commitment, DataType, StreamKind},
     storage::SubscriptionVersion,
     stream,
@@ -18,10 +18,13 @@ use crate::{
 /// results measured under different definitions. Provider order and tokens are not
 /// part of it (a rotated credential is the same measurement). Endpoint URLs can
 /// embed credentials, so the stored description shows only a short hash of each.
+/// The RPC source and validation policy also define which events can be measured.
 pub fn subscription_versions(
     filters: &FiltersConfig,
     window: Duration,
     providers: &[ProviderConfig],
+    validation: &SlotValidationConfig,
+    rpc_url: &str,
 ) -> [SubscriptionVersion; 6] {
     let filters = filters.normalized();
     let mut providers: Vec<(&str, &str)> = providers
@@ -45,7 +48,17 @@ pub fn subscription_versions(
         // Hash the actual normalized protobuf request, never provider credentials.
         let request = stream::subscribe_request(kind, &filters);
         let mut hash = blake3::Hasher::new();
-        hash.update(b"yellowstone-subscription-v2\0");
+        hash.update(b"yellowstone-subscription-v3-rpc-slots\0");
+        hash.update(&validation.slot_buffer.to_be_bytes());
+        for duration in [
+            validation.poll_interval,
+            validation.request_timeout,
+            validation.max_reference_age,
+        ] {
+            hash.update(&duration.as_nanos().to_be_bytes());
+        }
+        let rpc_hash = blake3::hash(rpc_url.trim().trim_end_matches('/').as_bytes());
+        hash.update(rpc_hash.as_bytes());
         hash.update(&request.encode_to_vec());
         hash.update(b"\0window-ns\0");
         hash.update(&window.as_nanos().to_be_bytes());
@@ -65,10 +78,10 @@ pub fn subscription_versions(
         SubscriptionVersion {
             id: hash.finalize().to_hex().to_string(),
             filters: format!(
-                "{};commitment={};window={};providers={provider_set};{description}",
+                "{};commitment={};window={};providers={provider_set};slot_buffer={};reference_rpc={};{description}",
                 kind.data_type.as_str(),
                 kind.commitment.as_str(),
-                format_window(window)
+                format_window(window), validation.slot_buffer, &rpc_hash.to_hex()[..8]
             ),
         }
     })
@@ -91,22 +104,82 @@ mod tests {
     use crate::config::Config;
 
     #[test]
+    fn rpc_policy_and_source_change_identity_without_exposing_credentials() {
+        let config = Config::example();
+        let url = "https://reference.invalid/private-test-token";
+        let versions = |validation: &SlotValidationConfig, url| {
+            subscription_versions(
+                &config.filters,
+                config.window,
+                &config.providers,
+                validation,
+                url,
+            )
+        };
+        let a = versions(&config.slot_validation, url);
+        let other = versions(
+            &config.slot_validation,
+            "https://other.invalid/private-test-token",
+        );
+        for (a, b) in a.iter().zip(other) {
+            assert!(a.filters.contains("slot_buffer=25;reference_rpc="));
+            assert!(!a.filters.contains("private-test-token"));
+            assert!(!a.filters.contains("reference.invalid"));
+            assert_ne!(a.id, b.id);
+        }
+        for field in 0..4 {
+            let mut validation = config.slot_validation.clone();
+            match field {
+                0 => validation.slot_buffer += 1,
+                1 => validation.poll_interval += Duration::from_millis(1),
+                2 => validation.request_timeout += Duration::from_millis(1),
+                _ => validation.max_reference_age += Duration::from_millis(1),
+            }
+            assert!(a
+                .iter()
+                .zip(versions(&validation, url))
+                .all(|(a, b)| a.id != b.id));
+        }
+    }
+
+    #[test]
     fn normalized_ids_are_stable_and_distinct_without_credentials() {
         let config = Config::example();
         let filters = config.filters.clone();
         let providers = config.providers.clone();
         let window = Duration::from_secs(5);
-        let versions = |filters: &FiltersConfig| subscription_versions(filters, window, &providers);
+        let versions = |filters: &FiltersConfig| {
+            subscription_versions(
+                filters,
+                window,
+                &providers,
+                &config.slot_validation,
+                &config.slot_validation.rpc_url().unwrap(),
+            )
+        };
         let a = versions(&filters);
         assert_eq!(a[0].id, versions(&filters)[0].id);
         assert!(a.iter().all(|v| v.filters.contains(";window=5s;")));
         // A different on-time window is a different measurement for every stream.
-        let other_window = subscription_versions(&filters, Duration::from_millis(1500), &providers);
+        let other_window = subscription_versions(
+            &filters,
+            Duration::from_millis(1500),
+            &providers,
+            &config.slot_validation,
+            &config.slot_validation.rpc_url().unwrap(),
+        );
         assert!(a.iter().zip(&other_window).all(|(a, b)| a.id != b.id));
         assert!(other_window[0].filters.contains(";window=1500ms;"));
         // The provider set is part of every stream's identity; order and tokens are not.
-        let with =
-            |providers: &[ProviderConfig]| subscription_versions(&filters, window, providers);
+        let with = |providers: &[ProviderConfig]| {
+            subscription_versions(
+                &filters,
+                window,
+                providers,
+                &config.slot_validation,
+                &config.slot_validation.rpc_url().unwrap(),
+            )
+        };
         let mut reordered_providers = providers.clone();
         reordered_providers.reverse();
         reordered_providers[0].token_env = Some("ROTATED_TOKEN".into());
