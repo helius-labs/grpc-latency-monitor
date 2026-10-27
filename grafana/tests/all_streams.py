@@ -93,6 +93,13 @@ windowed = SETUP.replace("('tx-new','transaction','processed','[]'",
     "('tx-new','transaction','processed','transaction;commitment=processed;window=5s;providers=A@1a2b3c4d,B@5e6f7a8b;transactions.account_include=[]'")
 assert 'Transactions include: all · window 5s · A, B' in {row['configuration'] for row in run('subscriptionDetails', setup=windowed)}
 
+# Transaction-aware account histories are visibly distinct from the old
+# first-update-per-account-and-slot histories; older labels remain unchanged.
+transaction_accounts = SETUP.replace("('ac-new','account','processed','[]'",
+    "('ac-new','account','processed','account;commitment=processed;window=5s;accounts.owner=[];nonempty_txn_signature=true;account_key=slot,pubkey,txn_signature'")
+account_labels = {row['configuration'] for row in run('subscriptionDetails', setup=transaction_accounts) if row['stream'] == 'account'}
+assert account_labels == {'Account owner: all', 'Account owner: all · per transaction · window 5s'}, account_labels
+
 # Time ranges without observations produce no selected subscription or false wins.
 assert run('providerLagSummaries', setup='') == run('providerWinSummary', setup='') == []
 assert run('locationWinRates', setup='') == run('providerMetricsTrend', setup='') == []

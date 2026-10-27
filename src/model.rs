@@ -48,11 +48,12 @@ pub struct StreamKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EventKey {
-    /// The first delivery of an account in a slot; subsequent writes are not
-    /// individually compared because write_version is not cross-provider stable.
+    /// One account update per transaction in a slot. Repeated deliveries of the
+    /// same tuple are deduplicated; node-local write_version is not an identity.
     Account {
         slot: u64,
         pubkey: Vec<u8>,
+        txn_signature: Vec<u8>,
     },
     Transaction {
         slot: u64,

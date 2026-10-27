@@ -308,7 +308,8 @@ async fn check_row<T: Row>(client: &Client, table: &str) -> anyhow::Result<()> {
 }
 
 /// Domain-separated canonical key encoding; neither subscriber identity nor provider is part of
-/// the identity. Account identifies the *first* update for a pubkey in a slot.
+/// the identity. Accounts include the modifying transaction's signature, so writes
+/// to the same pubkey by different transactions in one slot remain distinct.
 /// The stored `UInt128` event ID: the first 16 bytes of [`event_id`]. 128 bits keep
 /// collisions negligible while taking a quarter of the 64-character hex encoding.
 pub fn stored_event_id(stream: StreamKind, key: &EventKey) -> u128 {
@@ -327,10 +328,16 @@ pub fn event_id(stream: StreamKind, key: &EventKey) -> blake3::Hash {
     h.update(&[0]);
     h.update(&key.slot().to_be_bytes());
     match key {
-        EventKey::Account { pubkey, .. } => {
-            h.update(b"account\0");
+        EventKey::Account {
+            pubkey,
+            txn_signature,
+            ..
+        } => {
+            h.update(b"account-transaction-v2\0");
             h.update(&(pubkey.len() as u64).to_be_bytes());
             h.update(pubkey);
+            h.update(&(txn_signature.len() as u64).to_be_bytes());
+            h.update(txn_signature);
         }
         EventKey::Transaction { signature, .. } => {
             h.update(b"transaction\0");
@@ -880,17 +887,31 @@ mod tests {
     }
 
     #[test]
-    fn stable_event_id_is_stream_scoped_and_account_uses_first_pubkey_and_slot() {
+    fn stable_event_id_is_stream_scoped_and_account_includes_transaction() {
         let account = EventKey::Account {
             slot: 42,
             pubkey: vec![1, 2],
+            txn_signature: vec![3; 64],
         };
         let hash = event_id(stream(DataType::Account), &account);
         assert_eq!(
             hash.to_hex().as_str(),
-            "0fca32b86580d65ab880b250eb52e3296172abf8209d74f72964aeadc7ef8caf"
+            "307a73a79589e8ba94bb863a330f4863e1ed1428535bd5fe7e1201443b658d58"
         );
         assert_eq!(hash, event_id(stream(DataType::Account), &account));
+        let another_transaction = EventKey::Account {
+            slot: 42,
+            pubkey: vec![1, 2],
+            txn_signature: vec![4; 64],
+        };
+        assert_ne!(
+            hash,
+            event_id(stream(DataType::Account), &another_transaction)
+        );
+        assert_ne!(
+            stored_event_id(stream(DataType::Account), &account),
+            stored_event_id(stream(DataType::Account), &another_transaction)
+        );
         assert_ne!(
             hash,
             event_id(
@@ -907,7 +928,8 @@ mod tests {
                 stream(DataType::Account),
                 &EventKey::Account {
                     slot: 43,
-                    pubkey: vec![1, 2]
+                    pubkey: vec![1, 2],
+                    txn_signature: vec![3; 64],
                 }
             )
         );
@@ -917,7 +939,8 @@ mod tests {
                 stream(DataType::Account),
                 &EventKey::Account {
                     slot: 42,
-                    pubkey: vec![1, 3]
+                    pubkey: vec![1, 3],
+                    txn_signature: vec![3; 64],
                 }
             )
         );
@@ -940,6 +963,7 @@ mod tests {
         let key = EventKey::Account {
             slot: 7,
             pubkey: vec![9; 32],
+            txn_signature: vec![8; 64],
         };
         let row = ctx
             .lag(&model::LagRecord {

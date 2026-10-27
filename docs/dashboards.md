@@ -49,6 +49,8 @@ All Providers and Head to Head default to the last 30 minutes and refresh every 
 
 ## Selecting configurations
 
+Account histories using transaction-aware matching show **per transaction** in their configuration label. Each event identifies an account modified by a particular transaction in a slot. Older first-update-per-account-and-slot histories keep their original labels and separate configuration IDs.
+
 In All Providers and Head to Head, select region, cloud provider, stream and commitment. The subscription defaults to **Latest (automatic)**: on every refresh, each data type uses the subscription with the most recent observation within that scope and time range. Configurations remain separate, even when the range spans a filter change, and a range without observations shows no event metrics. For connection reporting, streams without observations fall back to the latest connection history within the preceding day and selected range, so an entire outage remains visible.
 
 - The **Configurations observed in this time range** table lists readable labels for every configuration in the range; graphs show only the selected one for each stream.

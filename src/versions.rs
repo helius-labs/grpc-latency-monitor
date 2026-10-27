@@ -49,6 +49,9 @@ pub fn subscription_versions(
         let request = stream::subscribe_request(kind, &filters);
         let mut hash = blake3::Hasher::new();
         hash.update(b"yellowstone-subscription-v3-rpc-slots\0");
+        if kind.data_type == DataType::Account {
+            hash.update(b"account-key-v2:slot,pubkey,txn_signature\0");
+        }
         hash.update(&validation.slot_buffer.to_be_bytes());
         for duration in [
             validation.poll_interval,
@@ -68,7 +71,10 @@ pub fn subscription_versions(
             hash.update(field.as_bytes());
         }
         let description = match kind.data_type {
-            DataType::Account => format!("accounts.owner={:?}", filters.accounts_owner),
+            DataType::Account => format!(
+                "accounts.owner={:?};nonempty_txn_signature=true;account_key=slot,pubkey,txn_signature",
+                filters.accounts_owner
+            ),
             DataType::Transaction => format!(
                 "transactions.account_include={:?};vote=all;failed=all",
                 filters.transactions_account_include
@@ -102,6 +108,38 @@ fn format_window(window: Duration) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn transaction_aware_accounts_start_new_histories_without_changing_other_streams() {
+        let config = Config::example();
+        let versions = subscription_versions(
+            &config.filters,
+            config.window,
+            &config.providers,
+            &config.slot_validation,
+            &config.slot_validation.rpc_url().unwrap(),
+        );
+        // IDs captured before the account-key change, with the example config
+        // and the same synthetic reference URL used by Config::example().
+        let previous = [
+            "c0ab45f32d6aef00fdf0f5d586843032d6c7378890a783121b23731cbba50308",
+            "ea1538592872de905b063720227d0749d9861b6ee809ee52c82b6f7776c0a5de",
+            "878df80495dd88093a3430c174a9bd6b9d90329ee18f208b3056e01ec69dc0eb",
+            "1ae3e4a8c57822737a9359fff92f40158b29f98f2f2253bc5430ec615e71dcae",
+            "cb6b7b069b92000631fd82e2722eccf4ddc88879ba7515549842717dcb4ed45b",
+            "1019017e8c502d015011272ee0f3a5806b5decf3d22fdcc091e3db0ad107d001",
+        ];
+        for (index, version) in versions.iter().enumerate() {
+            if index < 2 {
+                assert_ne!(version.id, previous[index]);
+                assert!(version.filters.contains(
+                    ";nonempty_txn_signature=true;account_key=slot,pubkey,txn_signature"
+                ));
+            } else {
+                assert_eq!(version.id, previous[index]);
+            }
+        }
+    }
 
     #[test]
     fn rpc_policy_and_source_change_identity_without_exposing_credentials() {

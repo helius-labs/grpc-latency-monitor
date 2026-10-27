@@ -89,6 +89,10 @@ Raw measurements use hourly partitions with `ttl_only_drop_parts`, so expiry dro
 whole parts instead of rewriting them; expired hours can remain up to about an hour
 longer before their part is dropped. `event_id` is a `UInt128` (the first 16 bytes
 of the event's BLAKE3 identity) rather than a 64-character hex string.
+Account identities include `(slot, pubkey, txn_signature)` with their own hash
+domain; different transactions modifying one account in a slot have different
+stored IDs. The account key change uses new subscription IDs and needs no schema
+migration. Transaction and slot event IDs retain their existing encoding.
 Adjust the worker safety window and dashboard routing if raw retention changes. For example, to extend summary history:
 
 ```sql

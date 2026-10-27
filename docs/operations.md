@@ -20,6 +20,8 @@ Copy `config.example.yaml` to a local file (`*.local.yaml` and `*.local.yml` are
 
 The example contains no working endpoints or secrets. Run one instance and configuration per `(region, cloud_provider)` pair. Filter lists are sorted and deduplicated before building the same request for every provider; changing a list changes that stream's subscription ID, keeping historical comparisons separate.
 
+Account streams always request `nonempty_txn_signature=true` and compare `(slot, pubkey, txn_signature)` at both commitments. Providers must support this filter and supply valid 64-byte transaction signatures. Unexpected missing, empty or malformed signatures use the normal malformed-update gap/reconnect path; there is no fallback to matching unrelated writes by account and slot. Updates without a modifying transaction, including ordinary startup snapshots, are outside this account workload. Multiple transactions touching one account now count as separate events, so recheck peak event rates and matcher capacity when upgrading from the old first-update-per-slot measurement. This starts new account configuration histories without a database migration.
+
 Latitude and longitude are your subscriber's city or datacenter coordinates; missing, null, non-finite or out-of-range values prevent startup. For example:
 
 ```yaml

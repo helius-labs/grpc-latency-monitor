@@ -190,7 +190,7 @@ impl Matcher {
     }
 
     /// Consume an observation; duplicate deliveries from the same provider
-    /// and key (including repeated account writes) are ignored.
+    /// and key (including repeated deliveries of one account/transaction tuple) are ignored.
     pub fn arrival(&mut self, arrival: Arrival) -> Vec<StorageRecord> {
         self.observe(arrival, false)
     }
@@ -475,6 +475,7 @@ mod tests {
         EventKey::Account {
             slot: n,
             pubkey: vec![1],
+            txn_signature: vec![1; 64],
         }
     }
     fn arrival(provider: usize, n: u64, at: Instant) -> Arrival {
@@ -521,6 +522,74 @@ mod tests {
                 "initial",
             );
         }
+    }
+
+    #[test]
+    fn accounts_modified_by_different_transactions_in_one_slot_are_compared_separately() {
+        let at = Instant::now();
+        let mut m = matcher(2, 4);
+        connect_all(&mut m, 2, at);
+        let account = |transaction| EventKey::Account {
+            slot: 42,
+            pubkey: vec![7; 32],
+            txn_signature: vec![transaction; 64],
+        };
+        // A is faster for transaction 1; B is faster for transaction 2. A alone
+        // delivers transaction 3. All three transactions modify the same account.
+        for (provider, transaction, delay) in [
+            (0, 1, 0),
+            (1, 2, 10),
+            (0, 2, 20),
+            (0, 3, 30),
+            (1, 1, 200),
+            (0, 1, 250),
+        ] {
+            m.arrival(Arrival {
+                provider,
+                key: account(transaction),
+                at: at + Duration::from_millis(delay),
+                utc: SystemTime::UNIX_EPOCH,
+                message_bytes: Some(100),
+            });
+        }
+        let mut actual: Vec<_> = m
+            .close(at + Duration::from_secs(2))
+            .into_iter()
+            .filter_map(|row| match row {
+                StorageRecord::Lag(lag) => match lag.key {
+                    EventKey::Account { txn_signature, .. } => {
+                        Some((txn_signature[0], lag.provider, lag.outcome, lag.lag_ns))
+                    }
+                    _ => panic!("unexpected event key"),
+                },
+                _ => None,
+            })
+            .collect();
+        actual.sort_unstable_by_key(|row| (row.0, row.1));
+        assert_eq!(
+            actual,
+            [
+                (1, 0, Outcome::OnTime, Some(0)),
+                (1, 1, Outcome::OnTime, Some(200_000_000)),
+                (2, 0, Outcome::OnTime, Some(10_000_000)),
+                (2, 1, Outcome::OnTime, Some(0)),
+                (3, 0, Outcome::OnTime, Some(0)),
+                (3, 1, Outcome::Missed, None),
+            ]
+        );
+        // A replay of any closed transaction still cannot reopen it.
+        for transaction in 1..=3 {
+            assert!(m
+                .arrival(Arrival {
+                    provider: 1,
+                    key: account(transaction),
+                    at: at + Duration::from_secs(3),
+                    utc: SystemTime::UNIX_EPOCH,
+                    message_bytes: Some(100),
+                })
+                .is_empty());
+        }
+        assert!(m.close(at + Duration::from_secs(4)).is_empty());
     }
 
     #[test]
@@ -968,6 +1037,7 @@ mod tests {
             key: EventKey::Account {
                 slot,
                 pubkey: vec![2],
+                txn_signature: vec![1; 64],
             },
             ..arrival(1, 0, at)
         };

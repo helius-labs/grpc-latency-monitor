@@ -210,6 +210,7 @@ pub fn subscribe_request(kind: StreamKind, filters: &FiltersConfig) -> Subscribe
                 FILTER_KEY.into(),
                 SubscribeRequestFilterAccounts {
                     owner: filters.accounts_owner,
+                    nonempty_txn_signature: Some(true),
                     ..Default::default()
                 },
             );
@@ -247,17 +248,21 @@ pub fn extract_event_key(
     match (&update.update_oneof, kind.data_type) {
         (Some(UpdateOneof::Ping(_) | UpdateOneof::Pong(_)), _) => Ok(None),
         (Some(UpdateOneof::Account(account)), DataType::Account) => {
-            let pubkey = &account
-                .account
-                .as_ref()
-                .ok_or("missing account info")?
-                .pubkey;
-            if pubkey.len() != 32 {
+            let info = account.account.as_ref().ok_or("missing account info")?;
+            if info.pubkey.len() != 32 {
                 return Err("invalid account pubkey");
+            }
+            let txn_signature = info
+                .txn_signature
+                .as_ref()
+                .ok_or("missing account transaction signature")?;
+            if txn_signature.len() != 64 {
+                return Err("invalid account transaction signature");
             }
             Ok(Some(EventKey::Account {
                 slot: account.slot,
-                pubkey: pubkey.clone(),
+                pubkey: info.pubkey.clone(),
+                txn_signature: txn_signature.clone(),
             }))
         }
         (Some(UpdateOneof::Transaction(transaction)), DataType::Transaction) => {
@@ -964,6 +969,7 @@ mod tests {
                         request.accounts[FILTER_KEY],
                         SubscribeRequestFilterAccounts {
                             owner: vec!["owner-a".into(), "owner-b".into()],
+                            nonempty_txn_signature: Some(true),
                             ..Default::default()
                         }
                     ),
@@ -984,12 +990,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_lists_request_all_accounts_and_transactions() {
+    fn empty_lists_request_transaction_linked_accounts_and_all_transactions() {
         let filters = FiltersConfig::default();
         assert_eq!(
             subscribe_request(kind(DataType::Account, Commitment::Processed), &filters).accounts
                 [FILTER_KEY],
-            SubscribeRequestFilterAccounts::default()
+            SubscribeRequestFilterAccounts {
+                nonempty_txn_signature: Some(true),
+                ..Default::default()
+            }
         );
         assert_eq!(
             subscribe_request(kind(DataType::Transaction, Commitment::Finalized), &filters)
@@ -999,11 +1008,45 @@ mod tests {
     }
 
     #[test]
+    fn account_keys_require_signatures_and_ignore_node_local_write_versions() {
+        let account = SubscribeUpdateAccount {
+            slot: 42,
+            account: Some(SubscribeUpdateAccountInfo {
+                pubkey: vec![7; 32],
+                txn_signature: Some(vec![8; 64]),
+                write_version: 100,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for commitment in Commitment::ALL {
+            let kind = kind(DataType::Account, commitment);
+            let extract = |account| extract_event_key(&update(UpdateOneof::Account(account)), kind);
+            let key = extract(account.clone()).unwrap().unwrap();
+            let mut another_node = account.clone();
+            another_node.account.as_mut().unwrap().write_version = 999_999;
+            assert_eq!(extract(another_node).unwrap().unwrap(), key);
+            let mut another_transaction = account.clone();
+            another_transaction.account.as_mut().unwrap().txn_signature = Some(vec![9; 64]);
+            assert_ne!(extract(another_transaction).unwrap().unwrap(), key);
+            for signature in [None, Some(vec![]), Some(vec![8; 63]), Some(vec![8; 65])] {
+                let mut invalid = account.clone();
+                invalid.account.as_mut().unwrap().txn_signature = signature;
+                assert!(
+                    extract(invalid).is_err(),
+                    "unidentifiable updates must not open comparisons"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn extracts_keys_and_rejects_malformed_or_wrong_types() {
         let account = update(UpdateOneof::Account(SubscribeUpdateAccount {
             slot: 42,
             account: Some(SubscribeUpdateAccountInfo {
                 pubkey: vec![7; 32],
+                txn_signature: Some(vec![9; 64]),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1028,7 +1071,8 @@ mod tests {
             extract_event_key(&account, a).unwrap(),
             Some(EventKey::Account {
                 slot: 42,
-                pubkey: vec![7; 32]
+                pubkey: vec![7; 32],
+                txn_signature: vec![9; 64],
             })
         );
         assert_eq!(

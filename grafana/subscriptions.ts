@@ -55,6 +55,8 @@ const configurations = `WITH observed AS (
      if(empty(addresses), 'all', arrayStringConcat(arrayMap(address ->
        concat(substring(address, 1, 6), '…', substring(address, -4)), arraySlice(addresses, 1, 3)), ', ')),
      if(length(addresses) > 3, concat(' +', toString(length(addresses) - 3), ' more'), ''))),
+   if(observed.data_type = 'account' AND position(metadata.filters, ';account_key=slot,pubkey,txn_signature') > 0,
+     ' · per transaction', ''),
    if(window_setting = '', '', concat(' · window ', window_setting)),
    if(provider_names = '', '', concat(' · ', provider_names)))
  AS configuration

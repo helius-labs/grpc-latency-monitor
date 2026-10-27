@@ -9,7 +9,7 @@ For each provider, the subscriber opens six independent streams, with identical 
 - account updates, transactions and slot updates,
 - each at **processed** and **finalized** commitment.
 
-Account streams can filter by `owner`; transaction streams can filter by `account_include`.
+Account streams can filter by `owner`; transaction streams can filter by `account_include`. Account subscriptions require a transaction signature (`nonempty_txn_signature=true`) at both commitments, excluding updates without a modifying transaction, including ordinary startup snapshots.
 
 On each subscriber, the same event is matched across providers. Each provider's delivery is recorded as a nanosecond lag behind the first observed arrival (the "ideal" provider). Matching uses a single configurable window, 5 seconds in the example configuration.
 
@@ -43,18 +43,20 @@ Up to `expired_key_capacity` exact keys are kept per stream. The default is `mat
 
 The window, provider set, RPC reference URL and slot-validation policy are part of each configuration's ID. Lag behind ideal and win shares are relative to every configured provider, so changing the window, or adding, removing, renaming or re-pointing a provider (a different endpoint URL), starts a new configuration. The RPC admission guard also starts new histories for all six streams. Results measured under different definitions are never mixed.
 
+Account identity is `(slot, pubkey, txn_signature)`, replacing the earlier first-update-per-account-and-slot measurement. The signature requirement and identity version start new histories for the two account streams; transaction and slot histories are unaffected. Account configuration labels include **per transaction** so historical results remain distinguishable.
+
 Provider order and separate provider tokens are not part of the ID, so a rotated x-token continues the same configuration. Stored descriptions and dashboard labels list provider names but show endpoints, including the reference RPC, only as a short hash, since URLs can embed credentials. Changing credentials embedded in a URL changes that URL's hash and configuration ID.
 
 ## Limits
 
 This is not an independent proof that every chain event was delivered.
 
-- Accounts are matched by `(slot, pubkey)` using only each provider's first update in that slot. Later writes in the same slot are received but **not** individually compared.
+- Accounts are matched by `(slot, pubkey, txn_signature)`. Different transactions updating the same account in one slot are separate events. Repeated deliveries or writes with the same tuple use only each provider's first delivery; node-local `write_version` is not compared across providers. Updates without a valid 64-byte transaction signature cannot open comparisons. Matching a transaction-linked account update does not independently verify its payload or ancestry.
 - UTC is used for report time ranges; monotonic timestamps are used for differences. Timestamps from different subscribers are never subtracted.
 
 ## Message size
 
-Account and transaction arrivals store `message_bytes`: the encoded size of that provider's full protobuf `SubscribeUpdate`, including metadata and the update envelope, excluding gRPC framing, HTTP/2, TLS and compression. Duplicate account writes and deliveries do not add bytes. Missed events and slot updates have NULL sizes, and throughput charts leave gaps for buckets with unknown sizes.
+Account and transaction arrivals store `message_bytes`: the encoded size of that provider's full protobuf `SubscribeUpdate`, including metadata and the update envelope, excluding gRPC framing, HTTP/2, TLS and compression. Repeated deliveries of an account/transaction tuple do not add bytes; different transactions modifying the same account count separately. Missed events and slot updates have NULL sizes, and throughput charts leave gaps for buckets with unknown sizes.
 
 ## Coverage
 
