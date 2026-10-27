@@ -35,6 +35,41 @@ pub enum Rejection {
     Future,
 }
 
+/// The reference tip used for admission and for detecting a disputed reference.
+/// Slot streams carry all statuses, independently of their configured commitment.
+#[derive(Clone, Copy)]
+pub(crate) enum ReferenceCommitment {
+    Processed,
+    Confirmed,
+    Finalized,
+}
+
+impl ReferenceCommitment {
+    pub const COUNT: usize = 3;
+
+    pub fn for_event(kind: StreamKind, key: &EventKey) -> Self {
+        match key {
+            EventKey::Slot { status, .. } => match SlotStatus::try_from(*status) {
+                Ok(SlotStatus::SlotFinalized) => Self::Finalized,
+                Ok(SlotStatus::SlotConfirmed) => Self::Confirmed,
+                _ => Self::Processed,
+            },
+            _ => match kind.commitment {
+                Commitment::Processed => Self::Processed,
+                Commitment::Finalized => Self::Finalized,
+            },
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Processed => 0,
+            Self::Confirmed => 1,
+            Self::Finalized => 2,
+        }
+    }
+}
+
 impl Reference {
     pub fn empty() -> Self {
         let now = Instant::now();
@@ -121,16 +156,10 @@ impl Reference {
             return Err(Rejection::Unavailable);
         }
         let tips = self.tips.ok_or(Rejection::Unavailable)?;
-        let tip = match key {
-            EventKey::Slot { status, .. } => match SlotStatus::try_from(*status) {
-                Ok(SlotStatus::SlotFinalized) => tips.finalized,
-                Ok(SlotStatus::SlotConfirmed) => tips.confirmed,
-                _ => tips.processed,
-            },
-            _ => match kind.commitment {
-                Commitment::Processed => tips.processed,
-                Commitment::Finalized => tips.finalized,
-            },
+        let tip = match ReferenceCommitment::for_event(kind, key) {
+            ReferenceCommitment::Processed => tips.processed,
+            ReferenceCommitment::Confirmed => tips.confirmed,
+            ReferenceCommitment::Finalized => tips.finalized,
         };
         let slot = key.slot();
         if slot < tip.saturating_sub(config.slot_buffer) {

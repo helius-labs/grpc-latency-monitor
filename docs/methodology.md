@@ -23,7 +23,7 @@ A trusted RPC supplies independent `getSlot` references at processed, confirmed 
 
 Admission runs before matching or recording slot fates. Stale replays and future outliers cannot open comparisons or move fork-history pruning; only the fresh RPC finalized reference advances the pruning watermark. The guard checks plausibility, not ancestry or block contents. In-range provider fate reports are still trusted, and the reference RPC must be accurate and current.
 
-No measurements are scored or certified until initial references arrive. An expired reference invalidates open comparisons and ends healthy coverage; recovery starts a new interval, including if a busy matcher observes only the recovered reference. Reference polling runs on the pipeline runtime without changing reader arrival stamps. See [Operations](operations.md#slot-reference) for defaults and failure behavior.
+No measurements are scored or certified until initial references arrive. An expired reference invalidates open comparisons and ends healthy coverage; recovery starts a new interval, including if a busy matcher observes only the recovered reference. A reference tip rejected by every connected provider also invalidates open comparisons and ends coverage. Slot rejections are tracked separately by reference commitment, so accepted processed traffic cannot hide rejected confirmed or finalized traffic. Coverage resumes no earlier than the observed recovery, even when a dispute starts and clears between ticks. Reference polling runs on the pipeline runtime without changing reader arrival stamps. See [Operations](operations.md#slot-reference) for defaults and failure behavior.
 
 ## Missed deadlines
 

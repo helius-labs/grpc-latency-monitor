@@ -20,7 +20,7 @@ use crate::{
         Arrival, Commitment, CoverageRecord, DataType, EventKey, GapRecord, StorageRecord,
         StreamKind,
     },
-    slots::{Reference, Rejection},
+    slots::{Reference, ReferenceCommitment, Rejection},
     stream::{InFlight, StreamControl},
 };
 
@@ -63,9 +63,11 @@ struct StreamState {
     last_finalized_reference: Option<u64>,
     /// stale, future, reference unavailable; aggregated once per tick.
     rejections: Vec<[u64; 3]>,
-    /// Per provider: rejected as out of bounds since its last admitted update.
-    /// When every connected provider is, the reference itself is suspect.
-    out_of_bounds: Vec<bool>,
+    /// Per provider and reference commitment: out of bounds since the last
+    /// in-bounds update using that tip. Unrelated slot statuses cannot clear it.
+    out_of_bounds: Vec<[bool; ReferenceCommitment::COUNT]>,
+    /// Observe transitions even when a dispute starts and clears between ticks.
+    reference_was_disputed: bool,
 }
 
 impl StreamState {
@@ -110,7 +112,8 @@ impl StreamState {
             reference_config: config.slot_validation.clone(),
             last_finalized_reference: None,
             rejections: vec![[0; 3]; count],
-            out_of_bounds: vec![false; count],
+            out_of_bounds: vec![[false; ReferenceCommitment::COUNT]; count],
+            reference_was_disputed: false,
         }
     }
 
@@ -153,16 +156,39 @@ impl StreamState {
         rows
     }
 
-    /// A reference that lags or leads the chain rejects every live update; that
-    /// must withhold certification rather than look like a quiet, healthy stream.
+    /// A tip rejected by every connected provider withholds certification, even
+    /// if other commitments on the same slot stream still admit updates.
     fn reference_disputed(&self) -> bool {
-        let mut connected = self
-            .connected
-            .iter()
-            .zip(&self.out_of_bounds)
-            .filter(|(connected, _)| **connected)
-            .peekable();
-        connected.peek().is_some() && connected.all(|(_, rejected)| *rejected)
+        self.connected.iter().any(|connected| *connected)
+            && (0..ReferenceCommitment::COUNT).any(|commitment| {
+                self.connected
+                    .iter()
+                    .zip(&self.out_of_bounds)
+                    .filter(|(connected, _)| **connected)
+                    .all(|(_, rejected)| rejected[commitment])
+            })
+    }
+
+    fn sync_dispute(&mut self, now: Instant, utc: SystemTime) -> Vec<StorageRecord> {
+        let disputed = self.reference_disputed();
+        let mut rows = Vec::new();
+        if disputed && !self.reference_was_disputed {
+            rows.extend(self.lose_health(None));
+            rows.extend(self.matcher.invalidate_open(
+                None,
+                now,
+                utc,
+                "RPC slot reference disputed",
+            ));
+        } else if !disputed && self.reference_was_disputed {
+            // A tick certifies up to now - processing_grace. Its next interval
+            // must start at recovery, not back inside the preceding dispute.
+            if self.healthy_after.is_none_or(|old| now > old.0) {
+                self.healthy_after = Some((now, utc));
+            }
+        }
+        self.reference_was_disputed = disputed;
+        rows
     }
 
     fn coverage_start(&self, at: Instant, utc: SystemTime) -> Coverage {
@@ -272,11 +298,16 @@ impl StreamState {
             } => {
                 let mut rows = self.lose_health(Some(provider));
                 self.connected[provider] = true;
-                self.out_of_bounds[provider] = false;
+                self.out_of_bounds[provider] = [false; ReferenceCommitment::COUNT];
+                rows.extend(self.sync_dispute(Instant::now(), SystemTime::now()));
                 // Healthy coverage starts with miss eligibility, after warmup.
-                self.coverage[provider] = self.reference_ready.then(|| {
-                    self.coverage_start(at + self.connection_warmup, utc + self.connection_warmup)
-                });
+                self.coverage[provider] = (self.reference_ready && !self.reference_was_disputed)
+                    .then(|| {
+                        self.coverage_start(
+                            at + self.connection_warmup,
+                            utc + self.connection_warmup,
+                        )
+                    });
                 rows.extend(
                     self.matcher
                         .connection_change(provider, at, utc, true, reason),
@@ -292,6 +323,7 @@ impl StreamState {
             } => {
                 self.connected[provider] = false;
                 let mut rows = self.lose_health(Some(provider));
+                rows.extend(self.sync_dispute(Instant::now(), SystemTime::now()));
                 rows.extend(
                     self.matcher
                         .connection_change(provider, at, utc, false, reason),
@@ -316,7 +348,8 @@ impl StreamState {
 
     fn arrival(&mut self, arrival: Arrival, processing_grace: Duration) -> Vec<StorageRecord> {
         let now = Instant::now();
-        let mut rows = self.sync_reference(now, SystemTime::now());
+        let utc = SystemTime::now();
+        let mut rows = self.sync_reference(now, utc);
         // Queueing delay is checked before slot bounds: a backlog ages slots below
         // the current tip, and must withhold health instead of blaming the provider.
         let stale = now.duration_since(arrival.at) > processing_grace;
@@ -332,6 +365,7 @@ impl StreamState {
                 ));
             }
         }
+        let commitment = ReferenceCommitment::for_event(self.kind, &arrival.key).index();
         let check = self.reference.borrow().check(
             self.kind,
             &arrival.key,
@@ -351,13 +385,19 @@ impl StreamState {
                 };
                 self.rejections[arrival.provider][index] =
                     self.rejections[arrival.provider][index].saturating_add(1);
-                if reason != Rejection::Unavailable {
-                    self.out_of_bounds[arrival.provider] = true;
+                if reason != Rejection::Unavailable
+                    && !self.out_of_bounds[arrival.provider][commitment]
+                {
+                    self.out_of_bounds[arrival.provider][commitment] = true;
+                    rows.extend(self.sync_dispute(now, utc));
                 }
                 return rows;
             }
         }
-        self.out_of_bounds[arrival.provider] = false;
+        if check.is_ok() && self.out_of_bounds[arrival.provider][commitment] {
+            self.out_of_bounds[arrival.provider][commitment] = false;
+            rows.extend(self.sync_dispute(now, utc));
+        }
         // A slot's fate is a fact regardless of whether this comparison is complete.
         if let EventKey::Slot { slot, status } = arrival.key {
             self.fates.record(slot, status);
@@ -642,9 +682,249 @@ mod tests {
         state.arrival(arrival(1, 2001), config.processing_grace);
         assert!(state.reference_disputed());
         assert_eq!(state.rejections, [[0, 1, 0], [0, 1, 0]]);
-        // Any admitted update clears its provider's flag.
+        // An in-bounds update using the same tip clears its provider's flag.
         state.arrival(arrival(1, 1040), config.processing_grace);
         assert!(!state.reference_disputed());
+    }
+
+    #[test]
+    fn accepted_slot_statuses_cannot_mask_a_dispute_about_another_tip() {
+        for (status, live_slot, other_status, other_slot) in [
+            (
+                SlotStatus::SlotConfirmed,
+                1038,
+                SlotStatus::SlotFinalized,
+                1000,
+            ),
+            (
+                SlotStatus::SlotFinalized,
+                1000,
+                SlotStatus::SlotConfirmed,
+                1038,
+            ),
+        ] {
+            let (config, _tx, mut state) = guarded_state(test_kind(), 2);
+            let (at, utc) = (Instant::now(), SystemTime::now());
+            for provider in 0..2 {
+                state.control(connected(provider, at - Duration::from_secs(1), utc));
+            }
+            let arrival = |provider, slot, status| Arrival {
+                provider,
+                key: EventKey::Slot {
+                    slot,
+                    status: status as i32,
+                },
+                at,
+                utc,
+                message_bytes: None,
+            };
+            state.arrival(arrival(0, 1100, status), config.processing_grace);
+            assert!(!state.reference_disputed());
+            assert!(state.coverage.iter().all(Option::is_some));
+            state.arrival(arrival(1, 1100, status), config.processing_grace);
+            assert!(state.reference_disputed());
+            assert!(state.coverage.iter().all(Option::is_none));
+            for provider in 0..2 {
+                state.arrival(
+                    arrival(provider, 1040, SlotStatus::SlotProcessed),
+                    config.processing_grace,
+                );
+                state.arrival(
+                    arrival(provider, other_slot, other_status),
+                    config.processing_grace,
+                );
+                assert!(state.reference_disputed());
+            }
+            state.arrival(arrival(0, live_slot, status), config.processing_grace);
+            assert!(!state.reference_disputed());
+        }
+    }
+
+    #[test]
+    fn a_dispute_requires_the_same_tip_and_only_connected_providers_vote() {
+        let (config, _tx, mut state) = guarded_state(test_kind(), 3);
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        for provider in 0..2 {
+            state.control(connected(provider, at - Duration::from_secs(1), utc));
+        }
+        let arrival = |provider, status| Arrival {
+            provider,
+            key: EventKey::Slot {
+                slot: 1100,
+                status: status as i32,
+            },
+            at,
+            utc,
+            message_bytes: None,
+        };
+        state.arrival(
+            arrival(0, SlotStatus::SlotFinalized),
+            config.processing_grace,
+        );
+        state.arrival(
+            arrival(1, SlotStatus::SlotConfirmed),
+            config.processing_grace,
+        );
+        assert!(!state.reference_disputed());
+        // Removing the only provider without a finalized rejection exposes the
+        // dispute; disconnected provider 2 must not hide it.
+        state.control(StreamControl::Disconnected {
+            provider: 1,
+            stream: test_kind(),
+            at,
+            utc,
+            reason: "fixture disconnect".into(),
+        });
+        assert!(state.reference_disputed());
+        assert!(state.coverage.iter().all(Option::is_none));
+        // Reconnection resets every commitment flag for that provider.
+        state.control(connected(0, at, utc));
+        assert!(!state.reference_disputed());
+        assert_eq!(state.out_of_bounds[0], [false; ReferenceCommitment::COUNT]);
+        let coverage = state.coverage[0].unwrap();
+        assert!(coverage.start >= state.healthy_after.unwrap().0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispute_recovery_between_ticks_cannot_backdate_coverage() {
+        let (config, _tx, mut state) = guarded_state(test_kind(), 2);
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        for provider in 0..2 {
+            state.control(connected(provider, at - Duration::from_secs(1), utc));
+            state.coverage[provider].as_mut().unwrap().certified = Some(utc);
+        }
+        let arrival = |provider, slot| Arrival {
+            provider,
+            key: EventKey::Slot {
+                slot,
+                status: SlotStatus::SlotFinalized as i32,
+            },
+            at: Instant::now(),
+            utc: SystemTime::now(),
+            message_bytes: None,
+        };
+        state.arrival(arrival(0, 1100), config.processing_grace);
+        let rows = state.arrival(arrival(1, 1100), config.processing_grace);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, StorageRecord::Coverage(c) if c.end == utc))
+                .count(),
+            2
+        );
+        assert!(rows.iter().any(|row| matches!(row,
+            StorageRecord::Gap(g) if g.reason == "RPC slot reference disputed")));
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let recovery = Instant::now();
+        state.arrival(arrival(0, 1000), config.processing_grace);
+        assert!(!state.reference_disputed());
+        // No certification tick saw the dispute, but its recovery boundary must
+        // still clamp a new interval whose usual start is now - processing_grace.
+        let coverage = state.coverage_start(
+            Instant::now() - config.processing_grace,
+            SystemTime::now() - config.processing_grace,
+        );
+        assert_eq!(coverage.start, recovery);
+        assert_eq!(coverage.start_utc, state.healthy_after.unwrap().1);
+        // A later recovery supersedes the previous boundary.
+        state.arrival(arrival(0, 1100), config.processing_grace);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        state.arrival(arrival(1, 1000), config.processing_grace);
+        assert!(state.healthy_after.unwrap().0 > recovery);
+    }
+
+    #[tokio::test]
+    async fn mixed_slot_traffic_withholds_coverage_until_dispute_recovery() {
+        let (mut config, references, _) = guarded_state(test_kind(), 2);
+        config.processing_grace = Duration::from_millis(500);
+        config.slot_validation.max_reference_age = Duration::from_secs(60);
+        let (arrivals_tx, arrivals) = mpsc::channel(16);
+        let (controls_tx, controls) = mpsc::channel(8);
+        let (storage, mut rows) = mpsc::channel(128);
+        let (stop, shutdown) = watch::channel(false);
+        let at = Instant::now();
+        let utc = SystemTime::now();
+        for provider in 0..2 {
+            controls_tx
+                .try_send(connected(
+                    provider,
+                    at - Duration::from_secs(1),
+                    utc - Duration::from_secs(1),
+                ))
+                .unwrap();
+        }
+        let task = tokio::spawn(super::match_stream(
+            test_kind(),
+            2,
+            config,
+            arrivals,
+            controls,
+            Arc::new(InFlight::new(2)),
+            Arc::default(),
+            references.subscribe(),
+            shutdown,
+            storage,
+            Duration::ZERO,
+        ));
+        tokio::task::yield_now().await;
+        // Discard startup certificates and connection records.
+        while rows.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let arrival = |provider, slot, status| Arrival {
+            provider,
+            key: EventKey::Slot {
+                slot,
+                status: status as i32,
+            },
+            at: Instant::now(),
+            utc: SystemTime::now(),
+            message_bytes: None,
+        };
+        for provider in 0..2 {
+            arrivals_tx
+                .try_send(arrival(provider, 1100, SlotStatus::SlotFinalized))
+                .unwrap();
+        }
+        for provider in 0..2 {
+            arrivals_tx
+                .try_send(arrival(provider, 1040, SlotStatus::SlotProcessed))
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        let disputed: Vec<_> = std::iter::from_fn(|| rows.try_recv().ok()).collect();
+        assert!(disputed.iter().any(|row| matches!(row,
+            StorageRecord::Gap(g) if g.reason == "RPC slot reference disputed")));
+        // A clean tick with valid processed traffic still cannot certify the
+        // stream while both providers' finalized updates are out of bounds.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let disputed: Vec<_> = std::iter::from_fn(|| rows.try_recv().ok()).collect();
+        assert!(!disputed.iter().any(|row| matches!(
+            row,
+            StorageRecord::Coverage(_) | StorageRecord::Connection(_)
+        )));
+        let recovery = arrival(0, 1000, SlotStatus::SlotFinalized);
+        let recovered_utc = recovery.utc;
+        arrivals_tx.try_send(recovery).unwrap();
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        let recovered: Vec<_> = std::iter::from_fn(|| rows.try_recv().ok()).collect();
+        let coverage: Vec<_> = recovered
+            .iter()
+            .filter_map(|row| match row {
+                StorageRecord::Coverage(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert!(!coverage.is_empty());
+        assert!(coverage.iter().all(|c| c.start >= recovered_utc));
+        assert!(!recovered
+            .iter()
+            .any(|row| matches!(row, StorageRecord::Connection(_))));
     }
 
     #[test]
@@ -672,7 +952,7 @@ mod tests {
         );
         assert!(state.coverage.iter().all(Option::is_none));
         assert_eq!(state.rejections[0], [0, 0, 0]);
-        assert!(!state.out_of_bounds[0]);
+        assert_eq!(state.out_of_bounds[0], [false; ReferenceCommitment::COUNT]);
     }
 
     #[test]
