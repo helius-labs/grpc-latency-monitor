@@ -225,7 +225,7 @@ pub fn subscribe_request(kind: StreamKind, filters: &FiltersConfig) -> Subscribe
             );
         }
         DataType::Slot => {
-            // Every slot status, including interslot stages, at both commitments.
+            // One subscription contains every slot status, including interslot stages.
             // Events are keyed by (slot, status), so each stage is compared separately.
             request.slots.insert(
                 FILTER_KEY.into(),
@@ -937,53 +937,56 @@ mod tests {
     }
 
     #[test]
-    fn request_is_one_filtered_stream_for_each_kind() {
+    fn request_is_one_filtered_stream_for_each_active_kind() {
         let filters = FiltersConfig {
             accounts_owner: vec!["owner-b".into(), "owner-a".into(), "owner-b".into()],
             transactions_account_include: vec!["account-b".into(), "account-a".into()],
+            ..Default::default()
         };
-        for commitment in Commitment::ALL {
-            for data_type in DataType::ALL {
-                let request = subscribe_request(kind(data_type, commitment), &filters);
-                assert_eq!(
-                    request.commitment,
-                    Some(match commitment {
-                        Commitment::Processed => 0,
-                        Commitment::Finalized => 2,
-                    })
-                );
-                assert_eq!(
-                    request.accounts.len() + request.transactions.len() + request.slots.len(),
-                    1
-                );
-                assert!(request.from_slot.is_none() && request.accounts_data_slice.is_empty());
-                assert!(
-                    request.transactions_status.is_empty()
-                        && request.blocks.is_empty()
-                        && request.blocks_meta.is_empty()
-                        && request.entry.is_empty()
-                        && request.ping.is_none()
-                );
-                match data_type {
-                    DataType::Account => assert_eq!(
-                        request.accounts[FILTER_KEY],
-                        SubscribeRequestFilterAccounts {
-                            owner: vec!["owner-a".into(), "owner-b".into()],
-                            nonempty_txn_signature: Some(true),
-                            ..Default::default()
-                        }
-                    ),
-                    DataType::Transaction => assert_eq!(
-                        request.transactions[FILTER_KEY],
-                        SubscribeRequestFilterTransactions {
-                            account_include: vec!["account-a".into(), "account-b".into()],
-                            ..Default::default()
-                        }
-                    ),
-                    DataType::Slot => {
-                        assert_eq!(request.slots[FILTER_KEY].filter_by_commitment, Some(false));
-                        assert_eq!(request.slots[FILTER_KEY].interslot_updates, Some(true));
+        for active in StreamKind::ALL {
+            let StreamKind {
+                data_type,
+                commitment,
+            } = active;
+            let request = subscribe_request(active, &filters);
+            assert_eq!(
+                request.commitment,
+                Some(match commitment {
+                    Commitment::Processed => 0,
+                    Commitment::Finalized => 2,
+                })
+            );
+            assert_eq!(
+                request.accounts.len() + request.transactions.len() + request.slots.len(),
+                1
+            );
+            assert!(request.from_slot.is_none() && request.accounts_data_slice.is_empty());
+            assert!(
+                request.transactions_status.is_empty()
+                    && request.blocks.is_empty()
+                    && request.blocks_meta.is_empty()
+                    && request.entry.is_empty()
+                    && request.ping.is_none()
+            );
+            match data_type {
+                DataType::Account => assert_eq!(
+                    request.accounts[FILTER_KEY],
+                    SubscribeRequestFilterAccounts {
+                        owner: vec!["owner-a".into(), "owner-b".into()],
+                        nonempty_txn_signature: Some(true),
+                        ..Default::default()
                     }
+                ),
+                DataType::Transaction => assert_eq!(
+                    request.transactions[FILTER_KEY],
+                    SubscribeRequestFilterTransactions {
+                        account_include: vec!["account-a".into(), "account-b".into()],
+                        ..Default::default()
+                    }
+                ),
+                DataType::Slot => {
+                    assert_eq!(request.slots[FILTER_KEY].filter_by_commitment, Some(false));
+                    assert_eq!(request.slots[FILTER_KEY].interslot_updates, Some(true));
                 }
             }
         }
@@ -991,7 +994,11 @@ mod tests {
 
     #[test]
     fn empty_lists_request_transaction_linked_accounts_and_all_transactions() {
-        let filters = FiltersConfig::default();
+        let filters = FiltersConfig {
+            allow_all_accounts: true,
+            allow_all_transactions: true,
+            ..Default::default()
+        };
         assert_eq!(
             subscribe_request(kind(DataType::Account, Commitment::Processed), &filters).accounts
                 [FILTER_KEY],

@@ -12,6 +12,8 @@ Three tests, each comparing a source against itself so that the expected differe
 
 Tests 1 and 2 used the subscriber's own code paths (readers, matching loop, ClickHouse writer and summaries) with the production runtime layout. All tests used Helius as the source, PumpSwap filters (accounts owned by and transactions including `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`), `window: 5s` and `processing_grace: 2s`.
 
+These historical runs used six streams and the earlier first-update-per-account-and-slot matching. The current subscriber compares transaction-linked account updates and uses five streams, with one slot subscription covering every status. The figures below describe the tested historical setup.
+
 An arrival is stamped when the gRPC stream yields a message, after it has been received and fully decoded. Every provider is stamped the same way, so comparisons stay fair, but decode time grows with message size, so large account updates are stamped slightly later than their bytes arrived.
 
 ## Results

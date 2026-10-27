@@ -47,14 +47,19 @@ slot_confirmation_timeout: "30s"
 filters:
   # Account updates with a transaction signature, owned by any listed program.
   # Each (slot, pubkey, transaction signature) is compared separately.
-  # Set [] to match any owner (much higher bandwidth). Same list at both commitments.
+  # Maximum 100 entries. Same list at both commitments; full account data is requested.
+  # Set [] only with allow_all_accounts: true (default false; much higher bandwidth).
   accounts_owner:
     - "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+  # allow_all_accounts: true
   # Transaction subscription: match transactions mentioning any listed account.
-  # Set [] to request ALL transactions. Votes and failed transactions remain included.
+  # Maximum 100 entries. Set [] only with allow_all_transactions: true (default false).
+  # Votes and failed transactions remain included.
   transactions_account_include:
     - "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
-  # Slot updates are always unfiltered. All providers receive identical requests.
+  # allow_all_transactions: true
+  # One unfiltered slot subscription contains every status, independent of commitment.
+  # All providers receive identical requests.
 
 subscriber:
   # Run one subscriber per region and cloud_provider combination.

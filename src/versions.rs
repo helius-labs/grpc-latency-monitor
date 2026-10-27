@@ -6,7 +6,7 @@ use prost::Message;
 
 use crate::{
     config::{FiltersConfig, ProviderConfig, SlotValidationConfig},
-    model::{Commitment, DataType, StreamKind},
+    model::{DataType, StreamKind},
     storage::SubscriptionVersion,
     stream,
 };
@@ -25,7 +25,7 @@ pub fn subscription_versions(
     providers: &[ProviderConfig],
     validation: &SlotValidationConfig,
     rpc_url: &str,
-) -> [SubscriptionVersion; 6] {
+) -> [SubscriptionVersion; StreamKind::ALL.len()] {
     let filters = filters.normalized();
     let mut providers: Vec<(&str, &str)> = providers
         .iter()
@@ -41,10 +41,7 @@ pub fn subscription_versions(
         .collect::<Vec<_>>()
         .join(",");
     std::array::from_fn(|i| {
-        let kind = StreamKind {
-            data_type: DataType::ALL[i / 2],
-            commitment: Commitment::ALL[i % 2],
-        };
+        let kind = StreamKind::ALL[i];
         // Hash the actual normalized protobuf request, never provider credentials.
         let request = stream::subscribe_request(kind, &filters);
         let mut hash = blake3::Hasher::new();
@@ -127,7 +124,6 @@ mod tests {
             "878df80495dd88093a3430c174a9bd6b9d90329ee18f208b3056e01ec69dc0eb",
             "1ae3e4a8c57822737a9359fff92f40158b29f98f2f2253bc5430ec615e71dcae",
             "cb6b7b069b92000631fd82e2722eccf4ddc88879ba7515549842717dcb4ed45b",
-            "1019017e8c502d015011272ee0f3a5806b5decf3d22fdcc091e3db0ad107d001",
         ];
         for (index, version) in versions.iter().enumerate() {
             if index < 2 {
@@ -252,11 +248,14 @@ mod tests {
                 .map(|v| &v.id)
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            6
+            StreamKind::ALL.len()
         );
         assert!(!a[0].filters.contains("token"));
 
         let mut reordered = filters.clone();
+        // Safety opt-ins do not alter the request while lists are nonempty.
+        reordered.allow_all_accounts = true;
+        reordered.allow_all_transactions = true;
         reordered
             .accounts_owner
             .extend(filters.accounts_owner.clone());

@@ -313,7 +313,7 @@ mod tests {
                 Err(Rejection::Future)
             );
         }
-        // Both slot subscriptions contain all statuses, regardless of commitment.
+        // Slot status chooses the reference independently of the stream label.
         for commitment in Commitment::ALL {
             for (status, slot) in [
                 (SlotStatus::SlotProcessed, 1040),

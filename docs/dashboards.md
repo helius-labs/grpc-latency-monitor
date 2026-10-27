@@ -2,6 +2,8 @@
 
 Three dashboards are defined with the **Grafana Foundation SDK**, sharing builders in [`grafana/shared.ts`](../grafana/shared.ts) and ClickHouse SQL in [`grafana/queries.ts`](../grafana/queries.ts).
 
+The **Commitment** selector applies to accounts and transactions. Slots always use the single stream containing all statuses, stored under `processed`, in either view. Retired slot duplicates stored under `finalized` are excluded from metrics, downtime and configuration history so they cannot be counted twice.
+
 **Definitions used across dashboards:**
 
 - **Ideal provider:** the first observed arrival for each event across all configured providers. Lag is milliseconds behind it, not chain-to-client latency.

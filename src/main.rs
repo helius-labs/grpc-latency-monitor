@@ -5,7 +5,7 @@ use clap::Parser;
 use solana_streaming_benchmark::{
     config::Config,
     forks::SlotFates,
-    model::{Commitment, DataType, StreamKind},
+    model::StreamKind,
     pipeline,
     rollups::{self, Worker},
     slots::{self, Reference},
@@ -140,7 +140,7 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
         cloud_provider = %config.subscriber.cloud_provider,
         region = %config.subscriber.region,
         providers = config.providers.len(),
-        streams_per_provider = 6,
+        streams_per_provider = StreamKind::ALL.len(),
         "starting benchmark"
     );
     let (storage_tx, storage_rx) = mpsc::channel(config.storage_buffer_capacity);
@@ -175,39 +175,33 @@ async fn run(config: Config, readers: tokio::runtime::Handle) -> Result<()> {
         stop.clone(),
     ));
     let fates = Arc::new(SlotFates::default());
-    for data_type in DataType::ALL {
-        for commitment in Commitment::ALL {
-            let kind = StreamKind {
-                data_type,
-                commitment,
-            };
-            let (arrivals_tx, arrivals_rx) = mpsc::channel(config.arrival_buffer_capacity);
-            let (controls_tx, controls_rx) = mpsc::channel(config.providers.len() * 4);
-            let in_flight = Arc::new(InFlight::new(config.providers.len()));
-            matchers.spawn(pipeline::match_stream(
-                kind,
-                config.providers.len(),
-                config.clone(),
-                arrivals_rx,
-                controls_rx,
-                in_flight.clone(),
-                fates.clone(),
-                reference.clone(),
-                stop.clone(),
-                storage_tx.clone(),
-                pipeline::COVERAGE_INTERVAL,
-            ));
-            for (i, provider) in config.providers.iter().enumerate() {
-                let provider = provider.clone();
-                let filters = config.filters.clone();
-                let arrivals = arrivals_tx.clone();
-                let controls = controls_tx.clone();
-                let in_flight = in_flight.clone();
-                stream_readers.spawn_on(
-                    stream::read_stream(i, provider, kind, filters, arrivals, controls, in_flight),
-                    &readers,
-                );
-            }
+    for kind in StreamKind::ALL {
+        let (arrivals_tx, arrivals_rx) = mpsc::channel(config.arrival_buffer_capacity);
+        let (controls_tx, controls_rx) = mpsc::channel(config.providers.len() * 4);
+        let in_flight = Arc::new(InFlight::new(config.providers.len()));
+        matchers.spawn(pipeline::match_stream(
+            kind,
+            config.providers.len(),
+            config.clone(),
+            arrivals_rx,
+            controls_rx,
+            in_flight.clone(),
+            fates.clone(),
+            reference.clone(),
+            stop.clone(),
+            storage_tx.clone(),
+            pipeline::COVERAGE_INTERVAL,
+        ));
+        for (i, provider) in config.providers.iter().enumerate() {
+            let provider = provider.clone();
+            let filters = config.filters.clone();
+            let arrivals = arrivals_tx.clone();
+            let controls = controls_tx.clone();
+            let in_flight = in_flight.clone();
+            stream_readers.spawn_on(
+                stream::read_stream(i, provider, kind, filters, arrivals, controls, in_flight),
+                &readers,
+            );
         }
     }
     drop(storage_tx);

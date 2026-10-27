@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 use crate::config::SubscriberConfig;
-use crate::model::{self, Commitment, DataType, EventKey, StorageRecord, StreamKind};
+use crate::model::{self, DataType, EventKey, StorageRecord, StreamKind};
 
 /// Durable minute IDs, not a row spool. Keep the directory on persistent storage.
 /// A failed database intent (including an ambiguous response) must survive restart
@@ -352,19 +352,6 @@ pub fn event_id(stream: StreamKind, key: &EventKey) -> blake3::Hash {
     h.finalize()
 }
 
-fn stream_index(stream: StreamKind) -> usize {
-    let data_type = match stream.data_type {
-        DataType::Account => 0,
-        DataType::Transaction => 1,
-        DataType::Slot => 2,
-    };
-    data_type * 2
-        + match stream.commitment {
-            Commitment::Processed => 0,
-            Commitment::Finalized => 1,
-        }
-}
-
 fn utc(value: SystemTime) -> OffsetDateTime {
     value.into()
 }
@@ -373,7 +360,7 @@ struct Context {
     cloud_provider: String,
     region: String,
     providers: Vec<String>,
-    versions: [SubscriptionVersion; 6],
+    versions: [SubscriptionVersion; StreamKind::ALL.len()],
 }
 
 impl Context {
@@ -383,8 +370,13 @@ impl Context {
             .cloned()
             .ok_or_else(|| format!("unknown provider index {index}"))
     }
-    fn subscription(&self, stream: StreamKind) -> String {
-        self.versions[stream_index(stream)].id.clone()
+    fn subscription(&self, stream: StreamKind) -> Result<String, String> {
+        stream
+            .index()
+            .map(|index| self.versions[index].id.clone())
+            .ok_or_else(|| {
+                "inactive stream: slots use a single subscription stored as processed".into()
+            })
     }
     fn lag(&self, record: &model::LagRecord) -> Result<LagRow, String> {
         if record.stream.data_type
@@ -406,7 +398,7 @@ impl Context {
             commitment: record.stream.commitment.as_str().into(),
             cloud_provider: self.cloud_provider.clone(),
             region: self.region.clone(),
-            subscription_id: self.subscription(record.stream),
+            subscription_id: self.subscription(record.stream)?,
             provider: self.provider(record.provider)?,
             event_utc: utc(record.first_utc),
             outcome: record.outcome.as_str().into(),
@@ -418,7 +410,7 @@ impl Context {
         Ok(ConnectionRow {
             cloud_provider: self.cloud_provider.clone(),
             region: self.region.clone(),
-            subscription_id: self.subscription(record.stream),
+            subscription_id: self.subscription(record.stream)?,
             provider: self.provider(record.provider)?,
             data_type: record.stream.data_type.as_str().into(),
             commitment: record.stream.commitment.as_str().into(),
@@ -431,7 +423,7 @@ impl Context {
         Ok(HealthRow {
             cloud_provider: self.cloud_provider.clone(),
             region: self.region.clone(),
-            subscription_id: self.subscription(record.stream),
+            subscription_id: self.subscription(record.stream)?,
             provider: Some(self.provider(record.provider)?),
             data_type: record.stream.data_type.as_str().into(),
             commitment: record.stream.commitment.as_str().into(),
@@ -445,7 +437,7 @@ impl Context {
         Ok(HealthRow {
             cloud_provider: self.cloud_provider.clone(),
             region: self.region.clone(),
-            subscription_id: self.subscription(record.stream),
+            subscription_id: self.subscription(record.stream)?,
             provider: record
                 .provider
                 .map(|index| self.provider(index))
@@ -571,7 +563,7 @@ pub async fn write(
     cloud_provider: String,
     region: String,
     providers: Vec<String>,
-    versions: [SubscriptionVersion; 6],
+    versions: [SubscriptionVersion; StreamKind::ALL.len()],
     mut receiver: mpsc::Receiver<StorageRecord>,
     limits: BatchLimits,
 ) -> Result<WriteSummary, WriteError> {
@@ -608,7 +600,7 @@ pub async fn write(
     let mut ids: Vec<_> = versions.iter().map(|v| &v.id).collect();
     ids.sort();
     ids.dedup();
-    if ids.len() != 6 {
+    if ids.len() != StreamKind::ALL.len() {
         return Err(invalid("subscription IDs must be distinct"));
     }
     let ctx = Context {
@@ -619,21 +611,14 @@ pub async fn write(
     };
     let mut metadata = Vec::new();
     let registered_utc = utc(SystemTime::now());
-    for data_type in DataType::ALL {
-        for commitment in Commitment::ALL {
-            let stream = StreamKind {
-                data_type,
-                commitment,
-            };
-            let version = &ctx.versions[stream_index(stream)];
-            metadata.push(VersionRow {
-                subscription_id: version.id.clone(),
-                data_type: data_type.as_str().into(),
-                commitment: commitment.as_str().into(),
-                filters: version.filters.clone(),
-                registered_utc,
-            });
-        }
+    for (stream, version) in StreamKind::ALL.into_iter().zip(&ctx.versions) {
+        metadata.push(VersionRow {
+            subscription_id: version.id.clone(),
+            data_type: stream.data_type.as_str().into(),
+            commitment: stream.commitment.as_str().into(),
+            filters: version.filters.clone(),
+            registered_utc,
+        });
     }
     insert_rows(&client, "benchmark_subscription_versions", &metadata)
         .await
@@ -672,6 +657,7 @@ pub async fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Commitment;
 
     #[tokio::test]
     async fn pending_minutes_survive_restart_and_journal_has_one_owner() {
@@ -869,6 +855,24 @@ mod tests {
         let coverage = sql.split("-- SHORT-RANGE COVERAGE GATE:").nth(1).unwrap();
         assert!(coverage.contains("WHERE region = {region:String}"));
         assert!(coverage.contains("AND cloud_provider = {cloud_provider:String}"));
+    }
+
+    #[test]
+    fn retired_duplicate_slot_stream_is_rejected_by_the_sink() {
+        let ctx = context();
+        let canonical = StreamKind {
+            data_type: DataType::Slot,
+            commitment: Commitment::Processed,
+        };
+        assert_eq!(ctx.subscription(canonical).unwrap(), "id-4");
+        let retired = StreamKind {
+            commitment: Commitment::Finalized,
+            ..canonical
+        };
+        assert!(ctx
+            .subscription(retired)
+            .unwrap_err()
+            .contains("inactive stream"));
     }
 
     #[test]

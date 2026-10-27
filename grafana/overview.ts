@@ -6,7 +6,7 @@ import { PanelBuilder as Table } from '@grafana/grafana-foundation-sdk/table';
 import { TableCellDisplayMode, TableCellBackgroundDisplayMode } from '@grafana/grafana-foundation-sdk/common';
 import { baseDashboard, addStreamVariables, selectFields, reuseResults } from './shared.js';
 import { ClickHouseQueryBuilder, datasource } from './clickhouse.js';
-import { dataTypeScope, latestWithConnections } from './subscriptions.js';
+import { dataTypeScope, commitmentScope, latestWithConnections } from './subscriptions.js';
 import { committedMinutes, withRollups } from './rollups.js';
 import { downtime, OUTAGE_SECONDS } from './queries.js';
 
@@ -16,20 +16,20 @@ export const overviewDashboard = baseDashboard('Solana Benchmark — Overview', 
   .time({ from: 'now-1h', to: 'now' }).refresh('1m');
 addStreamVariables(overviewDashboard);
 
-const filter = `kind = 'provider' AND ${dataTypeScope} AND commitment = \${commitment:sqlstring}
+const filter = `kind = 'provider' AND ${dataTypeScope} AND ${commitmentScope}
  AND bucket + INTERVAL 1 MINUTE > $__fromTime_ms AND bucket < $__toTime_ms
  AND (region, cloud_provider, bucket, generation) IN (${committedMinutes})`;
 // Like the other dashboards, compare only each location's latest configuration per stream.
 const latestStreams = `(region, cloud_provider, data_type, subscription_id) IN (
    ${latestWithConnections(`SELECT region, cloud_provider, data_type, subscription_id, last_seen
-   FROM benchmark_minute_rollups WHERE ${filter}`, `${dataTypeScope} AND commitment = \${commitment:sqlstring}`,
+   FROM benchmark_minute_rollups WHERE ${filter}`, `${dataTypeScope} AND ${commitmentScope}`,
    'region, cloud_provider, data_type')})`;
 const rollups = `SELECT * FROM benchmark_minute_rollups WHERE ${filter} AND ${latestStreams}`;
 // Downtime per location and provider, measured like the All Providers dashboard:
 // only outages of at least OUTAGE_SECONDS, from the disconnect to the next
 // successful subscription. Disconnects caused by the subscriber's own backlog are excluded.
 const providerDowntime = downtime('region, cloud_provider, provider',
-  `${dataTypeScope} AND commitment = \${commitment:sqlstring} AND ${latestStreams}`);
+  `${dataTypeScope} AND ${commitmentScope} AND ${latestStreams}`);
 // Providers are compared only within a location; nothing is pooled across
 // locations, since not every provider runs everywhere. A region is named with
 // its cloud provider only when it has several.

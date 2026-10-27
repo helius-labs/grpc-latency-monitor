@@ -3,8 +3,12 @@ import { activity, withRollups } from './rollups.js';
 // Keep configuration selection independent of provider selection so every panel
 // compares the same subscriptions. Resolve automatic mode on every refresh.
 export const dataTypeScope = `(\${data_type:sqlstring} = '__all' OR data_type = \${data_type:sqlstring})`;
+// One canonical all-status slot stream is used in either commitment view.
+// Exclude historical finalized-labelled duplicates from metrics and history.
+export const commitmentScope = `((data_type = 'slot' AND commitment = 'processed')
+ OR (data_type != 'slot' AND commitment = \${commitment:sqlstring}))`;
 export const streamScope = `region = \${region:sqlstring} AND cloud_provider = \${cloud_provider:sqlstring}
- AND ${dataTypeScope} AND commitment = \${commitment:sqlstring}`;
+ AND ${dataTypeScope} AND ${commitmentScope}`;
 
 // Connection history covers an outage even when no event was delivered in range.
 // Match the downtime query's lookback, and never select a future configuration.
@@ -42,7 +46,7 @@ const configurations = `WITH observed AS (
 ), metadata AS (
  SELECT subscription_id, argMax(filters, registered_utc) AS filters
  FROM benchmark_subscription_versions
- WHERE ${dataTypeScope} AND commitment = \${commitment:sqlstring}
+ WHERE ${dataTypeScope} AND ${commitmentScope}
  GROUP BY subscription_id
 ), configurations AS (
  SELECT observed.*, metadata.filters AS filters,
@@ -50,7 +54,7 @@ const configurations = `WITH observed AS (
  extract(metadata.filters, ';window=([^;]+)') AS window_setting,
  replaceAll(replaceRegexpAll(extract(metadata.filters, ';providers=([^;]+)'), '@[0-9a-f]+', ''), ',', ', ') AS provider_names,
  concat(multiIf(empty(metadata.filters), concat('Configuration ', substring(observed.subscription_id, 1, 8)),
-   observed.data_type = 'slot', 'Slot updates',
+   observed.data_type = 'slot', 'Slot updates (all statuses)',
    concat(if(observed.data_type = 'account', 'Account owner: ', 'Transactions include: '),
      if(empty(addresses), 'all', arrayStringConcat(arrayMap(address ->
        concat(substring(address, 1, 6), '…', substring(address, -4)), arraySlice(addresses, 1, 3)), ', ')),

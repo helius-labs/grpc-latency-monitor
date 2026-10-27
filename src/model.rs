@@ -46,6 +46,44 @@ pub struct StreamKind {
     pub commitment: Commitment,
 }
 
+impl StreamKind {
+    /// Slot lifecycle notifications contain all statuses regardless of the
+    /// requested commitment. Keep one canonical stream under `processed`.
+    pub const ALL: [Self; 5] = [
+        Self {
+            data_type: DataType::Account,
+            commitment: Commitment::Processed,
+        },
+        Self {
+            data_type: DataType::Account,
+            commitment: Commitment::Finalized,
+        },
+        Self {
+            data_type: DataType::Transaction,
+            commitment: Commitment::Processed,
+        },
+        Self {
+            data_type: DataType::Transaction,
+            commitment: Commitment::Finalized,
+        },
+        Self {
+            data_type: DataType::Slot,
+            commitment: Commitment::Processed,
+        },
+    ];
+
+    pub const fn index(self) -> Option<usize> {
+        match (self.data_type, self.commitment) {
+            (DataType::Account, Commitment::Processed) => Some(0),
+            (DataType::Account, Commitment::Finalized) => Some(1),
+            (DataType::Transaction, Commitment::Processed) => Some(2),
+            (DataType::Transaction, Commitment::Finalized) => Some(3),
+            (DataType::Slot, Commitment::Processed) => Some(4),
+            (DataType::Slot, Commitment::Finalized) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EventKey {
     /// One account update per transaction in a slot. Repeated deliveries of the
@@ -148,4 +186,39 @@ pub enum StorageRecord {
     Connection(ConnectionRecord),
     Gap(GapRecord),
     Coverage(CoverageRecord),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_streams_have_one_slot_subscription_and_consistent_storage_indices() {
+        assert_eq!(StreamKind::ALL.len(), 5);
+        assert_eq!(
+            StreamKind::ALL
+                .iter()
+                .filter(|s| s.data_type == DataType::Slot)
+                .count(),
+            1
+        );
+        assert_eq!(
+            StreamKind::ALL
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            5
+        );
+        for (index, stream) in StreamKind::ALL.into_iter().enumerate() {
+            assert_eq!(stream.index(), Some(index));
+        }
+        assert_eq!(
+            StreamKind {
+                data_type: DataType::Slot,
+                commitment: Commitment::Finalized
+            }
+            .index(),
+            None
+        );
+    }
 }

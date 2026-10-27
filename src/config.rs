@@ -125,13 +125,18 @@ fn default_slot_confirmation_timeout() -> Duration {
     Duration::from_secs(30)
 }
 
+/// Per-list cap, including duplicate entries. Providers may impose smaller limits.
+pub const MAX_FILTER_ADDRESSES: usize = 100;
+
 /// Yellowstone filters shared by every provider at both commitments.
-/// An empty list requests all messages of that type.
+/// Empty lists require a separate explicit opt-in for each data type.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FiltersConfig {
     pub accounts_owner: Vec<String>,
     pub transactions_account_include: Vec<String>,
+    pub allow_all_accounts: bool,
+    pub allow_all_transactions: bool,
 }
 
 impl FiltersConfig {
@@ -243,14 +248,30 @@ impl Config {
         nonempty(&self.clickhouse.database, "ClickHouse database")?;
         credential(&self.clickhouse.user_env, "ClickHouse user")?;
         credential(&self.clickhouse.password_env, "ClickHouse password")?;
-        for (name, keys) in [
-            ("filters.accounts_owner", &self.filters.accounts_owner),
+        for (name, keys, allow_all, opt_in) in [
+            (
+                "filters.accounts_owner",
+                &self.filters.accounts_owner,
+                self.filters.allow_all_accounts,
+                "filters.allow_all_accounts",
+            ),
             (
                 "filters.transactions_account_include",
                 &self.filters.transactions_account_include,
+                self.filters.allow_all_transactions,
+                "filters.allow_all_transactions",
             ),
         ] {
+            if keys.is_empty() && !allow_all {
+                bail!("{name} must not be empty unless {opt_in} is true");
+            }
+            if keys.len() > MAX_FILTER_ADDRESSES {
+                bail!("{name} exceeds the limit of {MAX_FILTER_ADDRESSES} entries");
+            }
             for key in keys {
+                if !(32..=44).contains(&key.len()) {
+                    bail!("{name} must contain 32-byte Solana public keys encoded in 32 to 44 base58 characters");
+                }
                 let decoded = bs58::decode(key)
                     .into_vec()
                     .with_context(|| format!("{name} contains an invalid base58 public key"))?;
@@ -332,6 +353,74 @@ mod tests {
             .replace("BENCH_CH_USER", "BENCH_TEST_CH_USER")
             .replace("BENCH_CH_PASSWORD", "BENCH_TEST_CH_PASSWORD")
             .replace("BENCH_PROVIDER_A_TOKEN", "BENCH_TEST_PROVIDER_TOKEN")
+    }
+
+    #[test]
+    fn unrestricted_filters_require_independent_explicit_opt_ins() {
+        let mut config = Config::example();
+        assert!(!config.filters.allow_all_accounts && !config.filters.allow_all_transactions);
+        config.filters.accounts_owner.clear();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("filters.allow_all_accounts"));
+        config.filters.allow_all_transactions = true;
+        assert!(
+            config.validate().is_err(),
+            "transaction opt-in cannot allow all accounts"
+        );
+        config.filters.allow_all_accounts = true;
+        config.validate().unwrap();
+        config.filters.transactions_account_include.clear();
+        config.filters.allow_all_transactions = false;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("filters.allow_all_transactions"));
+        config.filters.allow_all_transactions = true;
+        config.validate().unwrap();
+        let yaml = example();
+        let (prefix, rest) = yaml.split_once("filters:\n").unwrap();
+        let (_, subscriber) = rest.split_once("subscriber:\n").unwrap();
+        let without_filters = format!("{prefix}subscriber:\n{subscriber}");
+        assert!(
+            Config::from_yaml(&without_filters).is_err(),
+            "omitting filters cannot request everything implicitly"
+        );
+        let explicit = format!("{prefix}filters:\n  accounts_owner: []\n  transactions_account_include: []\n  allow_all_accounts: true\n  allow_all_transactions: true\nsubscriber:\n{subscriber}");
+        Config::from_yaml(&explicit).unwrap();
+    }
+
+    #[test]
+    fn filter_lists_are_bounded_even_with_an_unrestricted_opt_in() {
+        let base = Config::example();
+        let key = base.filters.accounts_owner[0].clone();
+        for accounts in [true, false] {
+            let mut config = base.clone();
+            let filters = &mut config.filters;
+            filters.allow_all_accounts = true;
+            filters.allow_all_transactions = true;
+            let list = if accounts {
+                &mut filters.accounts_owner
+            } else {
+                &mut filters.transactions_account_include
+            };
+            *list = vec![key.clone(); MAX_FILTER_ADDRESSES];
+            config.validate().unwrap();
+            let list = if accounts {
+                &mut config.filters.accounts_owner
+            } else {
+                &mut config.filters.transactions_account_include
+            };
+            list.push(key.clone());
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("limit of 100 entries"));
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
 // (retained six hours) and one over committed minute summaries. `route` picks one
 // on every refresh from the time range and bucket size; `exactQueries` exposes the
 // exact forms so the SQL tests can check that both agree.
-import { dataTypeScope, subscriptionScope as scope } from './subscriptions.js';
+import { dataTypeScope, commitmentScope, subscriptionScope as scope } from './subscriptions.js';
 import { activity, completeRawMinutes, states, withRollups } from './rollups.js';
 
 const displayProviders = '$__conditionalAll(provider IN (${provider:sqlstring}), $provider)';
@@ -147,7 +147,7 @@ const exactPairDroppedRate = perEvent(scope, pairProviders) + `SELECT $__timeInt
 
 // The map picks the most recently observed configuration within the time range
 // separately for every subscriber: configuration IDs can differ across locations.
-const mapFilter = `${dataTypeScope} AND commitment = \${commitment:sqlstring}`;
+const mapFilter = `${dataTypeScope} AND ${commitmentScope}`;
 const latestMap = `SELECT region, cloud_provider, data_type,
  argMax(subscription_id, tuple(last_seen, subscription_id)) FROM (${activity(mapFilter)})
  GROUP BY region, cloud_provider, data_type`;

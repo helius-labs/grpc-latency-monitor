@@ -42,6 +42,8 @@ export function addStreamVariables(dashboard: DashboardBuilder) {
     .staticOptions([{ text: 'All', value: '__all' }]).staticOptionsOrder('before')
     .current({ text: 'transaction', value: 'transaction' }));
   variable(dashboard, 'commitment', 'Commitment', 'SELECT DISTINCT commitment FROM benchmark_subscription_versions ORDER BY commitment', 'processed');
+  const commitment = dashboard.build().templating?.list?.find(item => item.name === 'commitment');
+  if (commitment) commitment.description = 'Applies to accounts and transactions. Slots use one stream containing every status in either view.';
 }
 
 export function addVariables(dashboard: DashboardBuilder, headToHead = false) {

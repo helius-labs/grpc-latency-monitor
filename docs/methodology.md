@@ -4,12 +4,14 @@ What the benchmark measures, how events are matched across providers, and what i
 
 ## What it measures
 
-For each provider, the subscriber opens six independent streams, with identical requests across providers:
+For each provider, the subscriber opens five independent streams, with identical requests across providers:
 
-- account updates, transactions and slot updates,
-- each at **processed** and **finalized** commitment.
+- account updates and transactions, each at **processed** and **finalized** commitment,
+- one slot stream containing all lifecycle statuses, including processed, confirmed and finalized.
 
-Account streams can filter by `owner`; transaction streams can filter by `account_include`. Account subscriptions require a transaction signature (`nonempty_txn_signature=true`) at both commitments, excluding updates without a modifying transaction, including ordinary startup snapshots.
+Slots are keyed by `(slot, status)`. Their single stream is stored under the existing `processed` label, with `filter_by_commitment=false` and `interslot_updates=true`; it receives every status. Dashboards use this stream in either commitment view and exclude the retired duplicate stored under `finalized` from metrics, downtime and configuration selection. No schema migration is needed; historical duplicate rows remain in the database for direct SQL inspection.
+
+Account streams can filter by `owner`; transaction streams can filter by `account_include`. Each list is limited to 100 entries; an empty list requires its own explicit `allow_all_accounts` or `allow_all_transactions` opt-in. These opt-ins only permit unrestricted requests and do not alter nonempty filters or measurement IDs. Account subscriptions require a transaction signature (`nonempty_txn_signature=true`) at both commitments, excluding updates without a modifying transaction, including ordinary startup snapshots.
 
 On each subscriber, the same event is matched across providers. Each provider's delivery is recorded as a nanosecond lag behind the first observed arrival (the "ideal" provider). Matching uses a single configurable window, 5 seconds in the example configuration.
 
@@ -41,7 +43,7 @@ Up to `expired_key_capacity` exact keys are kept per stream. The default is `mat
 
 ## Configurations
 
-The window, provider set, RPC reference URL and slot-validation policy are part of each configuration's ID. Lag behind ideal and win shares are relative to every configured provider, so changing the window, or adding, removing, renaming or re-pointing a provider (a different endpoint URL), starts a new configuration. The RPC admission guard also starts new histories for all six streams. Results measured under different definitions are never mixed.
+The window, provider set, RPC reference URL and slot-validation policy are part of each configuration's ID. Lag behind ideal and win shares are relative to every configured provider, so changing the window, or adding, removing, renaming or re-pointing a provider (a different endpoint URL), starts a new configuration. The RPC admission guard isolates earlier measurements under different configuration IDs. Results measured under different definitions are never mixed.
 
 Account identity is `(slot, pubkey, txn_signature)`, replacing the earlier first-update-per-account-and-slot measurement. The signature requirement and identity version start new histories for the two account streams; transaction and slot histories are unaffected. Account configuration labels include **per transaction** so historical results remain distinguishable.
 

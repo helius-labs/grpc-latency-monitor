@@ -8,6 +8,12 @@ Compares Yellowstone gRPC providers by when the same Solana events (accounts, tr
 
 Needs Rust, Docker, Yellowstone gRPC endpoints and a trusted Solana JSON-RPC endpoint for slot validation.
 
+Each subscriber opens **five independent gRPC connections per configured provider
+per location**: accounts and transactions at processed and finalized commitments,
+plus one slot stream containing every slot status. Size provider connection limits
+for all subscriber locations and any duplicate provider entries used for A/A tests.
+The reference RPC is polled separately over HTTP.
+
 ```sh
 docker compose up -d   # ClickHouse :8123, Grafana :3000 (override with CLICKHOUSE_PORT, GRAFANA_PORT)
 cp config.example.yaml config.local.yaml   # set providers, filters, location; clickhouse.url: http://localhost:8123

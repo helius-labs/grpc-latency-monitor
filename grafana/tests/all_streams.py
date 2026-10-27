@@ -10,9 +10,9 @@ from common import QUERIES, run_local
 from stream_fixture import SETUP
 
 
-def run(key, stream='__all', subscription='__latest', setup=SETUP, provider_a='A', provider_b='B', **options):
+def run(key, stream='__all', subscription='__latest', setup=SETUP, provider_a='A', provider_b='B', commitment='processed', **options):
     return run_local(setup, QUERIES[key], region='FRA2', cloud_provider='example-cloud', data_type=stream,
-                     commitment='processed', subscription_id=subscription,
+                     commitment=commitment, subscription_id=subscription,
                      provider_a=provider_a, provider_b=provider_b, **options)
 
 
@@ -86,7 +86,7 @@ assert run('subscriptionOptions') == []
 assert len(run('subscriptionOptions', stream='transaction')) == 2
 configs = run('subscriptionDetails')
 assert {row['stream'] for row in configs} == {'account', 'transaction', 'slot'}
-assert {row['configuration'] for row in configs} == {'Account owner: all', 'Transactions include: all', 'Slot updates'}
+assert {row['configuration'] for row in configs} == {'Account owner: all', 'Transactions include: all', 'Slot updates (all statuses)'}
 # The on-time window and the compared providers are part of a configuration's
 # identity and label; endpoints are only stored as hashes and never shown.
 windowed = SETUP.replace("('tx-new','transaction','processed','[]'",
@@ -99,6 +99,25 @@ transaction_accounts = SETUP.replace("('ac-new','account','processed','[]'",
     "('ac-new','account','processed','account;commitment=processed;window=5s;accounts.owner=[];nonempty_txn_signature=true;account_key=slot,pubkey,txn_signature'")
 account_labels = {row['configuration'] for row in run('subscriptionDetails', setup=transaction_accounts) if row['stream'] == 'account'}
 assert account_labels == {'Account owner: all', 'Account owner: all · per transaction · window 5s'}, account_labels
+
+# Slots have one all-status stream, stored under processed. Both commitment views
+# use it, and retired finalized-labelled duplicates cannot change metrics or health.
+duplicate_slots = SETUP + """
+INSERT INTO benchmark_event_lags VALUES
+ ('FRA2','example-cloud','sl-duplicate','slot','finalized','duplicate','A','2026-10-08 00:00:20','on_time',0,NULL),
+ ('FRA2','example-cloud','sl-duplicate','slot','finalized','duplicate','B','2026-10-08 00:00:20','missed',NULL,NULL);
+INSERT INTO benchmark_subscription_versions VALUES
+ ('sl-duplicate','slot','finalized','[]','2026-10-08 00:00:00');
+INSERT INTO benchmark_connection_events VALUES
+ ('FRA2','example-cloud','sl-duplicate','slot','finalized','A','2026-10-08 00:00:10',false,'stream EOF'),
+ ('FRA2','example-cloud','sl-duplicate','slot','finalized','A','2026-10-08 00:00:30',true,'subscribed');
+"""
+for key in ['providerMetricsTrend', 'providerWinSummary', 'pairSummary', 'subscriptionDetails', 'providerDowntime']:
+    expected = run(key, stream='slot')
+    assert expected, key
+    assert run(key, stream='slot', commitment='finalized', setup=duplicate_slots) == expected, key
+for key in ['providerMetricsTrend', 'pairSummary', 'locationWinRates', 'providerDowntime']:
+    assert run(key, commitment='finalized', setup=duplicate_slots) == run(key, commitment='finalized'), key
 
 # Time ranges without observations produce no selected subscription or false wins.
 assert run('providerLagSummaries', setup='') == run('providerWinSummary', setup='') == []
