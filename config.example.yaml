@@ -27,7 +27,7 @@ processing_grace: "2s"
 # After a window closes, remember its key this long so a later delivery is ignored
 # instead of starting a new comparison. Optional; defaults to 2m.
 expired_key_retention: "2m"
-# Closed keys remembered exactly, per stream (about 70 bytes each, allocated only
+# Closed keys remembered exactly, per stream (about 80 bytes each, allocated only
 # as keys arrive). Defaults to matcher_key_capacity x ceil(expired_key_retention /
 # (window + processing_grace + 1s)), which covers the whole retention at the rate
 # matcher_key_capacity is sized for: 1,500,000 here. Keys forgotten earlier are

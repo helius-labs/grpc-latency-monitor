@@ -377,19 +377,27 @@ impl StreamState {
             // Advancing the RPC tip must not discard an on-time peer of an
             // already-admitted key and invent a miss at the lower boundary.
             if reason != Rejection::Stale || !self.matcher.has_open(&arrival.key) {
-                let index = match reason {
-                    Rejection::Stale if stale => return rows,
-                    Rejection::Stale => 0,
-                    Rejection::Future => 1,
-                    Rejection::Unavailable => 2,
-                };
-                self.rejections[arrival.provider][index] =
-                    self.rejections[arrival.provider][index].saturating_add(1);
-                if reason != Rejection::Unavailable
-                    && !self.out_of_bounds[arrival.provider][commitment]
-                {
-                    self.out_of_bounds[arrival.provider][commitment] = true;
-                    rows.extend(self.sync_dispute(now, utc));
+                if !(reason == Rejection::Stale && stale) {
+                    let index = match reason {
+                        Rejection::Stale => 0,
+                        Rejection::Future => 1,
+                        Rejection::Unavailable => 2,
+                    };
+                    self.rejections[arrival.provider][index] =
+                        self.rejections[arrival.provider][index].saturating_add(1);
+                    if reason != Rejection::Unavailable
+                        && !self.out_of_bounds[arrival.provider][commitment]
+                    {
+                        self.out_of_bounds[arrival.provider][commitment] = true;
+                        rows.extend(self.sync_dispute(now, utc));
+                    }
+                }
+                // A later peer may pass admission after the RPC tip advances or
+                // recovers. It must not turn this discarded first delivery into
+                // a win for that peer or a missed deadline for this provider.
+                rows.extend(self.matcher.arrival_rejected(arrival));
+                if rows.iter().any(|row| matches!(row, StorageRecord::Gap(_))) {
+                    rows.extend(self.lose_health(None));
                 }
                 return rows;
             }
@@ -592,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn future_events_never_open_windows_or_poison_slot_fates() {
+    fn future_events_never_open_valid_comparisons_or_poison_slot_fates() {
         for kind in [
             test_kind(),
             StreamKind {
@@ -659,6 +667,181 @@ mod tests {
             let rows = state.close(at + Duration::from_secs(2), at + Duration::from_secs(2));
             assert!(rows.iter().any(|r| matches!(r, StorageRecord::Lag(l) if l.provider == 1 && l.outcome == Outcome::Missed)));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_first_delivery_cannot_reverse_results_across_an_rpc_boundary() {
+        let kinds = StreamKind::ALL.into_iter().flat_map(|kind| {
+            let statuses = if kind.data_type == DataType::Slot {
+                vec![
+                    Some(SlotStatus::SlotProcessed),
+                    Some(SlotStatus::SlotConfirmed),
+                    Some(SlotStatus::SlotFinalized),
+                ]
+            } else {
+                vec![None]
+            };
+            statuses.into_iter().map(move |status| (kind, status))
+        });
+        for (kind, status) in kinds {
+            for peer_delay in [Duration::from_millis(10), Duration::from_millis(1100)] {
+                let (config, references, mut state) = guarded_state(kind, 2);
+                let (at, utc) = (Instant::now(), SystemTime::now());
+                for provider in 0..2 {
+                    state.control(connected(provider, at - Duration::from_secs(1), utc));
+                }
+                let tips = references.borrow().tips.unwrap();
+                let tip = match status {
+                    Some(SlotStatus::SlotFinalized) => tips.finalized,
+                    Some(SlotStatus::SlotConfirmed) => tips.confirmed,
+                    Some(_) => tips.processed,
+                    None if kind.commitment == Commitment::Finalized => tips.finalized,
+                    None => tips.processed,
+                };
+                let key = |slot| match kind.data_type {
+                    DataType::Slot => EventKey::Slot {
+                        slot,
+                        status: status.unwrap() as i32,
+                    },
+                    DataType::Account => EventKey::Account {
+                        slot,
+                        pubkey: vec![1; 32],
+                        txn_signature: vec![1; 64],
+                    },
+                    DataType::Transaction => EventKey::Transaction {
+                        slot,
+                        signature: vec![1; 64],
+                    },
+                };
+                let event = key(tip + config.slot_validation.slot_buffer + 1);
+                let arrival = |provider, key| Arrival {
+                    provider,
+                    key,
+                    at: Instant::now(),
+                    utc: SystemTime::now(),
+                    message_bytes: None,
+                };
+                state.arrival(arrival(0, event.clone()), config.processing_grace);
+                assert_eq!(state.rejections[0], [0, 1, 0]);
+                assert!(!state.reference_disputed());
+                assert!(state.coverage.iter().all(Option::is_some));
+                if peer_delay > config.window {
+                    let end = at + config.window;
+                    assert!(state.close(end, end).is_empty());
+                }
+                tokio::time::advance(peer_delay).await;
+                let old = *references.borrow();
+                let mut next = tips;
+                next.processed += 1;
+                next.confirmed += 1;
+                next.finalized += 1;
+                references.send_replace(
+                    old.advance(
+                        next,
+                        Instant::now(),
+                        Instant::now(),
+                        SystemTime::now(),
+                        config.slot_validation.max_reference_age,
+                        config.slot_validation.slot_buffer,
+                    )
+                    .unwrap(),
+                );
+                state.arrival(arrival(1, event), config.processing_grace);
+                let end = Instant::now() + config.window;
+                assert!(
+                    state.close(end, end).is_empty(),
+                    "rejected A must not become missed while B wins: {kind:?}, {status:?}"
+                );
+                // Other valid keys still produce normal comparisons.
+                for provider in 0..2 {
+                    state.arrival(arrival(provider, key(tip + 2)), config.processing_grace);
+                }
+                let rows = state.close(end, end);
+                assert_eq!(rows.iter().filter(|row| matches!(row, StorageRecord::Lag(l) if l.outcome == Outcome::OnTime)).count(),2);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delivery_rejected_without_a_reference_stays_incomplete_after_recovery() {
+        let (config, references, mut state) = guarded_state(test_kind(), 2);
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        for provider in 0..2 {
+            state.control(connected(provider, at - Duration::from_secs(1), utc));
+        }
+        references.send_replace(Reference::empty());
+        let arrival = |provider| Arrival {
+            provider,
+            key: EventKey::Slot {
+                slot: 1040,
+                status: SlotStatus::SlotProcessed as i32,
+            },
+            at: Instant::now(),
+            utc: SystemTime::now(),
+            message_bytes: None,
+        };
+        state.arrival(arrival(0), config.processing_grace);
+        assert_eq!(state.rejections[0], [0, 0, 1]);
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let old = *references.borrow();
+        references.send_replace(
+            old.advance(
+                crate::slots::Tips {
+                    processed: 1040,
+                    confirmed: 1038,
+                    finalized: 1000,
+                },
+                Instant::now(),
+                Instant::now(),
+                SystemTime::now(),
+                config.slot_validation.max_reference_age,
+                config.slot_validation.slot_buffer,
+            )
+            .unwrap(),
+        );
+        state.arrival(arrival(1), config.processing_grace);
+        let end = Instant::now() + config.window;
+        assert!(state.close(end, end).is_empty());
+    }
+
+    #[test]
+    fn a_rejected_only_marker_cannot_bypass_the_stale_bound() {
+        let (config, references, mut state) = guarded_state(test_kind(), 2);
+        let (at, utc) = (Instant::now(), SystemTime::now());
+        for provider in 0..2 {
+            state.control(connected(provider, at - Duration::from_secs(1), utc));
+        }
+        let arrival = |provider| Arrival {
+            provider,
+            key: EventKey::Slot {
+                slot: 1026,
+                status: SlotStatus::SlotFinalized as i32,
+            },
+            at,
+            utc,
+            message_bytes: None,
+        };
+        state.arrival(arrival(0), config.processing_grace);
+        assert_eq!(state.rejections[0], [0, 1, 0]);
+        let old = *references.borrow();
+        references.send_replace(
+            old.advance(
+                crate::slots::Tips {
+                    processed: 1100,
+                    confirmed: 1080,
+                    finalized: 1052,
+                },
+                at,
+                at,
+                utc,
+                config.slot_validation.max_reference_age,
+                config.slot_validation.slot_buffer,
+            )
+            .unwrap(),
+        );
+        state.arrival(arrival(1), config.processing_grace);
+        assert_eq!(state.rejections[1], [1, 0, 0]);
+        assert_eq!(state.fates.fate(1026), crate::forks::Fate::Unknown);
     }
 
     #[test]

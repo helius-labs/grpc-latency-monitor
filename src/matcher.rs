@@ -33,21 +33,29 @@ struct Event {
     // An input gap can hide an earlier first arrival, invalidating every lag
     // classification for this key, not merely the missing-provider result.
     incomplete: bool,
+    /// Only keys that passed slot admission may advance replay floors.
+    validated: bool,
+}
+
+struct RememberedKey {
+    until: Instant,
+    floor: Option<SlotFloor>,
 }
 
 /// Closed or rejected keys, remembered as 64-bit digests so a late or repeated
 /// delivery cannot start a new comparison window. Without this, a provider
 /// arriving after the window would become the "first" arrival (lag 0) and every
 /// provider that delivered on time would be recorded as missing the deadline.
-/// Memory is bounded: the oldest entries are evicted beyond `capacity`. A digest
-/// forgotten for any reason raises a slot floor instead, and keys at or
+/// Memory is bounded: the oldest entries are evicted beyond `capacity`. A
+/// validated key forgotten for any reason raises a slot floor instead, and keys at or
 /// below the floor are treated as remembered: they are at least as old as the
-/// eviction horizon, so they cannot be a trustworthy first arrival.
+/// eviction horizon, so they cannot be a trustworthy first arrival. Rejected-only
+/// keys use the same bounded retention but cannot advance a slot floor.
 struct ExpiredKeys {
     retention: Duration,
     capacity: usize,
-    forget_at: HashMap<u64, Instant>,
-    order: VecDeque<(Instant, u64, SlotFloor)>,
+    forget_at: HashMap<u64, RememberedKey>,
+    order: VecDeque<(Instant, u64)>,
     /// Highest slot forgotten, per floor class. Survives normal digest expiry.
     floors: HashMap<FloorClass, u64>,
 }
@@ -71,13 +79,23 @@ impl ExpiredKeys {
             || self.floors.get(&class).is_some_and(|floor| slot <= *floor)
     }
 
-    fn insert(&mut self, digest: u64, floor: SlotFloor, until: Instant) {
+    fn validate(&mut self, digest: u64, floor: SlotFloor) {
+        if let Some(key) = self.forget_at.get_mut(&digest) {
+            key.floor = Some(floor);
+        }
+    }
+
+    fn insert(&mut self, digest: u64, floor: Option<SlotFloor>, until: Instant) {
         while self.order.len() >= self.capacity {
             self.pop_oldest();
         }
-        let forget_at = self.forget_at.entry(digest).or_insert(until);
-        *forget_at = (*forget_at).max(until);
-        self.order.push_back((until, digest, floor));
+        let key = self
+            .forget_at
+            .entry(digest)
+            .or_insert(RememberedKey { until, floor });
+        key.until = key.until.max(until);
+        key.floor = key.floor.or(floor);
+        self.order.push_back((until, digest));
     }
 
     fn prune(&mut self, now: Instant) {
@@ -87,13 +105,20 @@ impl ExpiredKeys {
     }
 
     fn pop_oldest(&mut self) {
-        if let Some((until, digest, (class, slot))) = self.order.pop_front() {
+        if let Some((until, digest)) = self.order.pop_front() {
             // A later insertion of the same digest extends its retention.
-            if self.forget_at.get(&digest).is_some_and(|at| *at <= until) {
-                self.forget_at.remove(&digest);
-                // Normal expiry must not allow an old replay to become first again.
-                let floor = self.floors.entry(class).or_insert(slot);
-                *floor = (*floor).max(slot);
+            if self
+                .forget_at
+                .get(&digest)
+                .is_some_and(|key| key.until <= until)
+            {
+                let key = self.forget_at.remove(&digest).expect("key remembered");
+                // Rejected-only slots are untrusted: a far-future outlier must
+                // not poison the replay floor when its marker expires or is evicted.
+                if let Some((class, slot)) = key.floor {
+                    let floor = self.floors.entry(class).or_insert(slot);
+                    *floor = (*floor).max(slot);
+                }
             }
         }
     }
@@ -192,22 +217,34 @@ impl Matcher {
     /// Consume an observation; duplicate deliveries from the same provider
     /// and key (including repeated deliveries of one account/transaction tuple) are ignored.
     pub fn arrival(&mut self, arrival: Arrival) -> Vec<StorageRecord> {
-        self.observe(arrival, false)
+        self.observe(arrival, false, true)
     }
 
     /// A valid comparison can finish while its slot ages below admission bounds.
     /// This never permits opening a new window or replaying a closed comparison.
     pub(crate) fn has_open(&self, key: &EventKey) -> bool {
-        self.events.contains_key(key)
+        self.events.get(key).is_some_and(|event| event.validated)
     }
 
     /// A stamp delayed beyond processing grace cannot establish a trustworthy
     /// first arrival, even when it is the first input seen for a new key.
     pub fn arrival_incomplete(&mut self, arrival: Arrival) -> Vec<StorageRecord> {
-        self.observe(arrival, true)
+        self.observe(arrival, true, true)
     }
 
-    fn observe(&mut self, arrival: Arrival, incomplete: bool) -> Vec<StorageRecord> {
+    /// Retain a rejected delivery as an incomplete comparison so another
+    /// provider cannot become first merely by crossing an RPC admission boundary.
+    /// Reuse the normal bounded windows and retention, without trusting its slot.
+    pub(crate) fn arrival_rejected(&mut self, arrival: Arrival) -> Vec<StorageRecord> {
+        self.observe(arrival, true, false)
+    }
+
+    fn observe(
+        &mut self,
+        arrival: Arrival,
+        incomplete: bool,
+        validated: bool,
+    ) -> Vec<StorageRecord> {
         assert!(
             arrival.provider < self.providers.len(),
             "invalid provider index"
@@ -224,6 +261,9 @@ impl Matcher {
             let digest = digest(&key);
             let floor = slot_floor(&key);
             if self.expired.contains(digest, floor) {
+                if validated {
+                    self.expired.validate(digest, floor);
+                }
                 // After its window (or a repeat): already classified as
                 // a missed deadline for this provider. Never start a new first arrival.
                 return records;
@@ -232,7 +272,8 @@ impl Matcher {
                 // Remember the dropped key: a later delivery of it must not
                 // become the first arrival. Other keys' windows are unaffected.
                 let until = at + self.window + self.expired.retention;
-                self.expired.insert(digest, floor, until);
+                self.expired
+                    .insert(digest, validated.then_some(floor), until);
                 if !self.overloaded {
                     self.overloaded = true;
                     records.push(StorageRecord::Gap(GapRecord {
@@ -272,11 +313,13 @@ impl Matcher {
                     deadline: at + self.window,
                     observations,
                     incomplete: incomplete || overlaps_gap,
+                    validated,
                 },
             );
         }
         let event = self.events.get_mut(&key).expect("key inserted");
         event.incomplete |= incomplete;
+        event.validated |= validated;
         if event.observations[provider].arrived.is_some() {
             return records;
         }
@@ -449,7 +492,11 @@ impl Matcher {
                     }
                 }
             }
-            expired.insert(digest(key), slot_floor(key), now + expired.retention);
+            expired.insert(
+                digest(key),
+                event.validated.then(|| slot_floor(key)),
+                now + expired.retention,
+            );
             false
         });
         records
@@ -966,6 +1013,66 @@ mod tests {
         assert!(m.close(forgotten + Duration::from_secs(5)).is_empty());
         m.arrival(arrival(1, 2, forgotten));
         assert_eq!(m.events.len(), 1, "newer slots are still admitted");
+    }
+
+    #[test]
+    fn rejected_keys_stay_incomplete_before_and_after_the_window_closes() {
+        for close_first in [false, true] {
+            let t = Instant::now();
+            let mut m = matcher(2, 4);
+            connect_all(&mut m, 2, t);
+            m.arrival_rejected(arrival(0, 100, t));
+            assert!(!m.has_open(&key(100)), "not an admitted comparison");
+            if close_first {
+                assert!(m.close(t + Duration::from_secs(1)).is_empty());
+            }
+            let peer = t + Duration::from_millis(if close_first { 1100 } else { 10 });
+            m.arrival(arrival(1, 100, peer));
+            assert!(m.close(peer + Duration::from_secs(2)).is_empty());
+            assert!(m.events.is_empty());
+            // The now-validated key keeps normal replay protection even after
+            // the incomplete window's exact digest expires.
+            let after_retention = peer + RETENTION + Duration::from_secs(3);
+            m.close(after_retention);
+            assert_eq!(m.expired.floors.get(&None), Some(&100));
+            m.arrival(arrival(0, 100, after_retention));
+            assert!(m.events.is_empty());
+            m.arrival(arrival(0, 101, after_retention));
+            assert_eq!(
+                lags(m.close(after_retention + Duration::from_secs(1))).len(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_only_keys_cannot_poison_floors_on_expiry_or_eviction() {
+        for overflow_open_windows in [false, true] {
+            let t = Instant::now();
+            let mut m = matcher(2, 1);
+            connect_all(&mut m, 2, t);
+            if overflow_open_windows {
+                m.arrival(arrival(0, 100, t));
+            }
+            for n in 0..10 {
+                let at = t + Duration::from_secs(n * 2);
+                m.arrival_rejected(arrival(0, 1_000_000 + n, at));
+                if !overflow_open_windows {
+                    assert!(m.close(at + Duration::from_secs(1)).is_empty());
+                }
+                assert!(m.events.len() <= 1);
+                assert!(m.expired.order.len() <= 2 && m.expired.forget_at.len() <= 2);
+                assert!(m.expired.floors.is_empty());
+            }
+            let after_retention = t + RETENTION + Duration::from_secs(30);
+            m.close(after_retention);
+            // Drain the formerly open valid key's retention too.
+            m.close(after_retention + RETENTION + Duration::from_secs(1));
+            assert!(m.expired.floors.values().all(|slot| *slot <= 100));
+            let live = after_retention + RETENTION + Duration::from_secs(2);
+            m.arrival(arrival(0, 101, live));
+            assert_eq!(lags(m.close(live + Duration::from_secs(1))).len(), 2);
+        }
     }
 
     #[test]
