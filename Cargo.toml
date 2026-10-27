@@ -14,7 +14,8 @@ anyhow = "1"
 blake3 = "1"
 bs58 = "0.5"
 clap = { version = "4", features = ["derive"] }
-clickhouse = { version = "0.15", features = ["rustls-tls", "time"] }
+# Use the same crypto backend as reqwest so tonic can initialize Rustls unambiguously.
+clickhouse = { version = "0.15", features = ["rustls-tls-ring", "rustls-tls-webpki-roots", "time"] }
 dotenvy = "0.15"
 futures = "0.3"
 humantime-serde = "1"

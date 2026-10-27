@@ -710,6 +710,20 @@ async fn read_connection(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn https_clients_initialize_without_conflicting_crypto_providers() {
+        // Exercise the production dependency features without opening a socket.
+        // Mixing ClickHouse's default AWS-LC with reqwest's Ring makes tonic's
+        // TLS setup panic before any gRPC connection can be attempted.
+        let _clickhouse = clickhouse::Client::default();
+        let _reference_rpc = reqwest::Client::builder().build().unwrap();
+        let _grpc = GeyserGrpcClient::build_from_static("https://provider.invalid")
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .unwrap()
+            .connect_lazy()
+            .unwrap();
+    }
+
     #[test]
     fn connection_diagnostics_never_include_server_messages_or_credentials() {
         let secret = "https://provider.invalid/private-token?api-key=secret";
