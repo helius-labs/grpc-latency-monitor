@@ -57,10 +57,10 @@ fn connection_failure(
 }
 const FILTER_KEY: &str = "benchmark";
 
-/// Reconnect cadence by how long the outage has lasted: every second for the first
-/// minute, every 15 s until 15 minutes, then every minute. A recorded outage ends at
-/// most one interval after the provider's recovery, while a long outage is not
-/// retried constantly.
+/// The wait between reconnect attempts by how long the outage has lasted: every
+/// second for the first minute, every 15 s until 15 minutes, then every minute, so a
+/// long outage is not retried constantly. A recorded outage can end up to one wait
+/// plus an attempt's connect and subscribe timeouts after the provider's recovery.
 const RETRY_SCHEDULE: [(Duration, Duration); 2] = [
     (Duration::from_secs(60), Duration::from_secs(1)),
     (Duration::from_secs(15 * 60), Duration::from_secs(15)),

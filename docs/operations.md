@@ -94,7 +94,7 @@ Connections:
 - Adaptive HTTP/2 receive windows let flow control adjust to connection throughput and latency.
 - HTTP/2 keepalive pings (every 10 seconds, 10-second acknowledgement timeout) detect dead connections. The reader also pings every 10 seconds and reconnects a stream that receives no update, ping or pong for 30 seconds.
 - Subscriptions time out after 10 seconds. Messages up to 64 MiB are accepted (tonic's default is 4 MiB; accounts can hold up to 10 MiB).
-- A subscription that stayed up for 30 seconds reconnects immediately after it drops, unless the disconnect was caused by the subscriber's own backlog. Until a subscription stays up that long again, attempts follow the time since the outage began: every second for the first minute, every 15 seconds until 15 minutes, then every minute, so a long outage is not retried constantly. A recorded outage end lags the provider's recovery by at most one interval: a second early on, up to a minute after 15 minutes.
+- A subscription that stayed up for 30 seconds reconnects immediately after it drops, unless the disconnect was caused by the subscriber's own backlog. Until a subscription stays up that long again, the wait between attempts follows the time since the outage began: every second for the first minute, every 15 seconds until 15 minutes, then every minute, so a long outage is not retried constantly. An attempt in progress at the provider's recovery can still run until its timeouts (10 seconds to connect, 10 seconds to subscribe) before that wait begins, so a recorded outage end can lag the recovery by up to one wait plus 20 seconds.
 
 ## Reports
 
