@@ -26,8 +26,8 @@ const latestStreams = `(region, cloud_provider, data_type, subscription_id) IN (
    'region, cloud_provider, data_type')})`;
 const rollups = `SELECT * FROM benchmark_minute_rollups WHERE ${filter} AND ${latestStreams}`;
 // Downtime per location and provider, measured like the All Providers dashboard:
-// only outages of at least OUTAGE_SECONDS, from the disconnect to the next
-// successful subscription. Disconnects caused by the subscriber's own backlog are excluded.
+// only outages with a refused reconnect or of at least OUTAGE_SECONDS, from the
+// disconnect to the next successful subscription. Disconnects caused by the subscriber's own backlog are excluded.
 const providerDowntime = downtime('region, cloud_provider, provider',
   `${dataTypeScope} AND ${commitmentScope} AND ${latestStreams}`);
 // Providers are compared only within a location; nothing is pooled across
@@ -75,7 +75,7 @@ const metrics: Array<[string, string, string, number, string, Steps | null]> = [
     'Share of a connected provider’s events not delivered within the configured window after the first provider’s delivery, even if delivery arrives later.',
     [[0.1, '#EAB839'], [0.5, '#FF9830'], [1, '#F2495C']]],
   ['disconnected_seconds', 'Downtime', 's', 1,
-    `Time each provider’s streams at that location could not reconnect: outages lasting at least ${OUTAGE_SECONDS} s, from a disconnect until the next successful subscription, summed over streams. A shorter interruption, such as a rolling restart that accepts the reconnect right away, counts only as a disconnect. Disconnects caused by the subscriber’s own backlog are excluded. A stalled stream counts only from the moment it is dropped for inactivity (30 s without traffic); events in the stall count as missed deadlines.`,
+    `Time each provider’s streams at that location could not reconnect: outages from a disconnect until the next successful subscription, summed over streams, when a reconnect was refused or the outage lasted at least ${OUTAGE_SECONDS} s. Another interruption, such as a rolling restart that accepts the reconnect right away, counts only as a disconnect. Disconnects caused by the subscriber’s own backlog are excluded. A stalled stream counts only from the moment it is dropped for inactivity (30 s without traffic); events in the stall count as missed deadlines.`,
     [[0.001, '#EAB839'], [10, '#FF9830'], [60, '#F2495C']]],
   ['disconnects', 'Disconnects', 'none', 0,
     'How often each provider’s streams at that location were interrupted, including short reconnects that are not downtime. Disconnects caused by the subscriber’s own backlog are excluded.',

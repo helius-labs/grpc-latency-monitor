@@ -216,17 +216,19 @@ function connectionEvents(providers: string, connected: boolean): string {
  AND connected = ${connected} ORDER BY event_utc`;
 }
 
-// A disconnected period shorter than this is a reconnect, not downtime: a rolling
-// restart behind one endpoint drops the stream, but resubscribing works right away.
+// A disconnected period this long is downtime even without a refused reconnect: a
+// single attempt can hang until its connect and subscribe timeouts.
 export const OUTAGE_SECONDS = 10;
 
-// Downtime per `keys`: outages where reconnecting kept failing. An outage runs from
-// a disconnect, through failed reconnect attempts, to the next successful
-// subscription. Outages lasting at least OUTAGE_SECONDS count in full, clipped to
-// the range and summed over streams; shorter ones count only as disconnects. An
-// outage still open at the range end is judged by how long it lasted afterwards
-// (or until now). Events while a provider is disconnected are excluded from
-// comparisons instead of counted as missed deadlines, so downtime is reported here.
+// Downtime per `keys`: outages where reconnecting failed. An outage runs from a
+// disconnect, through failed reconnect attempts, to the next successful
+// subscription. An outage with a refused reconnect (a provider failure right after
+// another disconnect) or lasting at least OUTAGE_SECONDS counts in full, clipped to
+// the range and summed over streams. Others, such as a rolling restart behind one
+// endpoint that accepts the first reconnect, count only as disconnects. An outage
+// still open at the range end is judged by what happened afterwards (or until now).
+// Events while a provider is disconnected are excluded from comparisons instead of
+// counted as missed deadlines, so downtime is reported here.
 // A subscriber restart without a recorded disconnect is not provider downtime, and
 // neither is a disconnect caused by the subscriber's own backlog (reason texts from
 // LOCAL_DISCONNECTS in src/stream.rs); a provider failure while reconnecting is.
@@ -234,16 +236,17 @@ export const localDisconnects = `('arrival queue full', 'control queue full')`;
 export function downtime(keys: string, where: string): string {
   return `SELECT ${keys},
  sumIf(greatest(0, dateDiff('millisecond', greatest(start_utc, range_start), least(end_utc, range_end))),
-   dateDiff('millisecond', start_utc, end_utc) >= ${OUTAGE_SECONDS * 1000}) / 1000 AS disconnected_seconds,
+   refused OR dateDiff('millisecond', start_utc, end_utc) >= ${OUTAGE_SECONDS * 1000}) / 1000 AS disconnected_seconds,
  countIf(start_utc >= range_start AND start_utc <= range_end) AS disconnects
  FROM (SELECT ${keys}, min(event_utc) AS start_utc, max(next_utc) AS end_utc,
-  any(range_start) AS range_start, any(range_end) AS range_end
+  max(after_disconnect) AS refused, any(range_start) AS range_start, any(range_end) AS range_end
   FROM (SELECT ${keys}, subscription_id, event_utc,
    NOT connected AND reason NOT IN ${localDisconnects} AS provider_down,
    CAST($__fromTime_ms AS DateTime64(9, 'UTC')) AS range_start,
    CAST($__toTime_ms AS DateTime64(9, 'UTC')) AS range_end,
    -- Rows of one outage share the last transition before them that was not downtime.
    maxIf(event_utc, connected OR reason IN ${localDisconnects}) OVER before AS outage,
+   NOT lagInFrame(connected, 1, true) OVER stream AS after_disconnect,
    leadInFrame(event_utc, 1, least(now64(9, 'UTC'), range_end + INTERVAL ${OUTAGE_SECONDS} SECOND)) OVER stream AS next_utc
    FROM benchmark_connection_events WHERE ${where}
    AND event_utc <= $__toTime_ms + INTERVAL ${OUTAGE_SECONDS} SECOND AND event_utc >= $__fromTime_ms - INTERVAL 1 DAY

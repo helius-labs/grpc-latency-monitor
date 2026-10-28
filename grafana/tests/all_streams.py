@@ -144,7 +144,7 @@ forked = SETUP.replace("'unpaired','B','2026-10-08 00:00:13','missed'", "'unpair
 assert values('providerWinSummary', 'win_percent', setup=forked) == {'A': 60, 'B': 40}
 assert values('providerMetricsTrend', 'dropped_per_second', setup=forked) == {'A': 0, 'B': 0}
 
-# Downtime counts outages of at least 10 s, in full. B's transaction stream
+# Downtime counts outages with a refused reconnect or of at least 10 s, in full. B's transaction stream
 # disconnects at :20, fails a retry at :25 and resubscribes at :50 (30 s). Its slot
 # stream disconnects 60 s before the range ends and never returns; a disconnect
 # from the previous day ends inside the range.
@@ -159,12 +159,16 @@ transitions += [('ac-new', 'account', 'B', '2026-10-08 00:10:00', False), ('ac-n
                 ('ac-new', 'account', 'B', '2026-10-08 00:59:55', False), ('ac-new', 'account', 'B', '2026-10-08 01:00:20', True),
                 ('ac-new', 'account', 'A', '2026-10-08 00:59:58', False), ('ac-new', 'account', 'A', '2026-10-08 01:00:03', True)]
 # A's own backlog forces a reconnect (not provider downtime); a provider failure on
-# the first reconnect attempt is a disconnect, but at 2 s (:42 to :44) not downtime.
+# the first reconnect attempt refuses it, so its 2 s (:42 to :44) are downtime.
 transitions += [('tx-new', 'transaction', 'A', '2026-10-08 00:00:40', False, 'arrival queue full'),
                 ('tx-new', 'transaction', 'A', '2026-10-08 00:00:42', False, 'connection failed'),
                 ('tx-new', 'transaction', 'A', '2026-10-08 00:00:44', True, 'subscribed'),
                 ('ac-new', 'account', 'A', '2026-10-08 00:00:40', False, 'arrival queue full'),
                 ('ac-new', 'account', 'A', '2026-10-08 00:00:41', True, 'subscribed')]
+# A provider drop followed by a refused reconnect is downtime however short: 4 s.
+transitions += [('sl-new', 'slot', 'A', '2026-10-08 00:20:00', False, 'stream EOF'),
+                ('sl-new', 'slot', 'A', '2026-10-08 00:20:01', False, 'connection failed'),
+                ('sl-new', 'slot', 'A', '2026-10-08 00:20:04', True, 'subscribed')]
 # A resubscription dropped because the matcher could not take its connection yet is
 # also A's own backlog: the 39 s until the next subscription is not downtime.
 transitions += [('sl-new', 'slot', 'A', '2026-10-08 00:30:00', False, 'arrival queue full'),
@@ -174,14 +178,14 @@ outage = SETUP + 'INSERT INTO benchmark_connection_events VALUES ' + ','.join(
     f"('FRA2','example-cloud','{t[0]}','{t[1]}','processed','{t[2]}','{t[3]}',{str(t[4]).lower()},'{t[5] if len(t) > 5 else 'test'}')"
     for t in transitions) + ';'
 downtime = {row['provider']: row for row in run('providerDowntime', setup=outage)}
-assert downtime['A']['disconnected_seconds'] == 0 and downtime['A']['disconnects'] == 2, downtime
+assert downtime['A']['disconnected_seconds'] == 2 + 4 and downtime['A']['disconnects'] == 3, downtime
 assert downtime['B']['disconnected_seconds'] == 30 + 60 + 30 + 5, downtime
 assert downtime['B']['disconnects'] == 4, downtime  # the retry and the earlier outage don't recount
-assert values('providerDowntime', 'disconnected_seconds', stream='transaction', setup=outage) == {'A': 0, 'B': 30}
+assert values('providerDowntime', 'disconnected_seconds', stream='transaction', setup=outage) == {'A': 2, 'B': 30}
 assert values('providerDowntime', 'disconnected_seconds', stream='account', setup=outage) == {'A': 0, 'B': 35}
 pair = run('pairDowntime', setup=outage)[0]
-assert (pair['a_disconnected_seconds'], pair['b_disconnected_seconds']) == (0, 125), pair
-assert (pair['a_disconnects'], pair['b_disconnects']) == (2, 4), pair
+assert (pair['a_disconnected_seconds'], pair['b_disconnected_seconds']) == (6, 125), pair
+assert (pair['a_disconnects'], pair['b_disconnects']) == (3, 4), pair
 assert len(run('disconnectedEvents', setup=outage)) > 0
 
 print('All-stream fixtures passed: latest configurations, pooled percentiles and wins, safe event joins, '
