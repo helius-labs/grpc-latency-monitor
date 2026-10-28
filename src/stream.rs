@@ -57,12 +57,17 @@ fn connection_failure(
 }
 const FILTER_KEY: &str = "benchmark";
 
-/// Backoff between consecutive failed attempts. The cap keeps a long outage from
-/// being retried constantly; a recorded outage can then end up to this long after
-/// the provider's recovery.
-const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Reconnect cadence by how long the outage has lasted: every second for the first
+/// minute, every 15 s until 15 minutes, then every minute. A recorded outage ends at
+/// most one interval after the provider's recovery, while a long outage is not
+/// retried constantly.
+const RETRY_SCHEDULE: [(Duration, Duration); 2] = [
+    (Duration::from_secs(60), Duration::from_secs(1)),
+    (Duration::from_secs(15 * 60), Duration::from_secs(15)),
+];
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
-/// A subscription that stayed up this long reconnects immediately and resets the backoff.
+/// A subscription that stayed up this long ends the outage: its disconnect starts a
+/// new one and, unless caused by a local backlog, reconnects immediately.
 const STABLE_SUBSCRIPTION: Duration = Duration::from_secs(30);
 /// HTTP/2 PING cadence and acknowledgement deadline: detects dead TCP paths that
 /// would otherwise leave a provider "connected" (and accruing misses) indefinitely.
@@ -175,23 +180,31 @@ impl Drop for Stamp<'_> {
     }
 }
 
-/// The delay before reconnecting and the backoff after that. A subscription that
-/// stayed up long enough reconnects immediately, so a provider's rolling restart
-/// costs only the reconnect itself rather than our wait; repeated quick failures
-/// keep backing off.
-fn retry_delay(backoff: Duration, subscribed_for: Option<Duration>) -> (Duration, Duration) {
-    if subscribed_for.is_some_and(|duration| duration >= STABLE_SUBSCRIPTION) {
-        (Duration::ZERO, INITIAL_RETRY_DELAY)
-    } else {
-        (backoff, (backoff * 2).min(MAX_RETRY_DELAY))
-    }
+/// The delay before the next attempt of an outage that began `outage` ago.
+fn retry_delay(outage: Duration) -> Duration {
+    RETRY_SCHEDULE
+        .iter()
+        .find(|(until, _)| outage < *until)
+        .map_or(MAX_RETRY_DELAY, |(_, delay)| *delay)
 }
 
-/// Like `retry_delay`, but a local backlog is not a provider restart: never
-/// reconnect into it immediately, however long the subscription lasted.
-fn retry_after(backoff: Duration, disconnect: &Disconnect) -> (Duration, Duration) {
-    let local = LOCAL_DISCONNECTS.contains(&disconnect.reason);
-    retry_delay(backoff, disconnect.subscribed_for.filter(|_| !local))
+/// Whether a disconnect ends a stable subscription and so starts a new outage.
+fn starts_outage(disconnect: &Disconnect) -> bool {
+    disconnect
+        .subscribed_for
+        .is_some_and(|duration| duration >= STABLE_SUBSCRIPTION)
+}
+
+/// Like `retry_delay`, but a provider's drop of a stable subscription reconnects
+/// immediately, so a rolling restart costs only the reconnect itself rather than our
+/// wait. A local backlog is not a provider restart: never reconnect into it
+/// immediately, however long the subscription lasted.
+fn retry_after(outage: Duration, disconnect: &Disconnect) -> Duration {
+    if starts_outage(disconnect) && !LOCAL_DISCONNECTS.contains(&disconnect.reason) {
+        Duration::ZERO
+    } else {
+        retry_delay(outage)
+    }
 }
 
 /// One data type per request. Filters are shared across providers and commitments.
@@ -429,8 +442,8 @@ impl Disconnect {
 }
 
 /// Run one provider/stream pair until the arrival or control receiver closes.
-/// Spawn one task per provider and `StreamKind`; reconnects use bounded backoff
-/// that resets after a stable subscription.
+/// Spawn one task per provider and `StreamKind`; reconnects follow `RETRY_SCHEDULE`
+/// from the start of the outage, which ends with a stable subscription.
 /// A full arrival queue produces a gap and a fresh subscription, never a silent drop.
 /// Local backlogs back off; the reader stops only when the matcher has stopped.
 pub async fn read_stream(
@@ -442,7 +455,7 @@ pub async fn read_stream(
     controls: mpsc::Sender<StreamControl>,
     in_flight: Arc<InFlight>,
 ) {
-    let mut backoff = INITIAL_RETRY_DELAY;
+    let mut outage_start = None;
     loop {
         if arrivals.is_closed() || controls.is_closed() {
             return;
@@ -466,8 +479,11 @@ pub async fn read_stream(
         else {
             return;
         };
-        let (delay, next_backoff) = retry_after(backoff, &disconnect);
-        backoff = next_backoff;
+        let now = Instant::now();
+        if starts_outage(&disconnect) {
+            outage_start = None;
+        }
+        let delay = retry_after(now - *outage_start.get_or_insert(now), &disconnect);
         tracing::warn!(
             provider = %provider.name,
             data_type = kind.data_type.as_str(),
@@ -874,9 +890,10 @@ mod tests {
                 reason,
                 subscribed_for: long,
             };
+            assert!(starts_outage(&disconnect));
             assert_eq!(
-                retry_after(INITIAL_RETRY_DELAY, &disconnect),
-                (INITIAL_RETRY_DELAY, INITIAL_RETRY_DELAY * 2)
+                retry_after(Duration::ZERO, &disconnect),
+                Duration::from_secs(1)
             );
         }
         // A provider's disconnect after a stable subscription still reconnects at once.
@@ -884,10 +901,7 @@ mod tests {
             reason: "stream EOF",
             subscribed_for: long,
         };
-        assert_eq!(
-            retry_after(INITIAL_RETRY_DELAY * 8, &provider),
-            (Duration::ZERO, INITIAL_RETRY_DELAY)
-        );
+        assert_eq!(retry_after(Duration::ZERO, &provider), Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]
@@ -921,33 +935,31 @@ mod tests {
     }
 
     #[test]
-    fn stable_subscriptions_reconnect_immediately_and_failures_back_off() {
-        let stable = Some(STABLE_SUBSCRIPTION);
-        assert_eq!(
-            retry_delay(MAX_RETRY_DELAY, stable),
-            (Duration::ZERO, INITIAL_RETRY_DELAY)
-        );
-        let mut backoff = INITIAL_RETRY_DELAY;
-        let mut delays = Vec::new();
-        for subscribed_for in [
-            None,
-            Some(Duration::from_secs(5)),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+    fn retries_follow_the_schedule_until_a_stable_subscription() {
+        let delays: Vec<_> = [0, 59, 60, 899, 900, 3600]
+            .map(|seconds| retry_delay(Duration::from_secs(seconds)).as_secs())
+            .into();
+        assert_eq!(delays, [1, 1, 15, 15, 60, 60]);
+        // Failed attempts and short subscriptions continue the outage; a stable one ends it.
+        for (subscribed_for, starts) in [
+            (None, false),
+            (Some(Duration::from_secs(5)), false),
+            (Some(STABLE_SUBSCRIPTION), true),
         ] {
-            let (delay, next_backoff) = retry_delay(backoff, subscribed_for);
-            backoff = next_backoff;
-            delays.push(delay.as_secs());
+            let disconnect = Disconnect {
+                reason: "stream EOF",
+                subscribed_for,
+            };
+            assert_eq!(starts_outage(&disconnect), starts);
+            assert_eq!(
+                retry_after(Duration::from_secs(120), &disconnect),
+                if starts {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(15)
+                }
+            );
         }
-        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 60, 60]);
-        assert_eq!(
-            retry_delay(backoff, Some(Duration::from_secs(3600))),
-            (Duration::ZERO, INITIAL_RETRY_DELAY)
-        );
     }
 
     #[test]
