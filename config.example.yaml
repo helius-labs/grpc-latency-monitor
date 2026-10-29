@@ -54,7 +54,7 @@ filters:
   # allow_all_accounts: true
   # Transaction subscription: match transactions mentioning any listed account.
   # Maximum 100 entries. Set [] only with allow_all_transactions: true (default false).
-  # Votes and failed transactions remain included.
+  # Failed transactions are excluded; votes remain included.
   transactions_account_include:
     - "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
   # allow_all_transactions: true

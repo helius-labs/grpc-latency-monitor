@@ -232,6 +232,7 @@ pub fn subscribe_request(kind: StreamKind, filters: &FiltersConfig) -> Subscribe
             request.transactions.insert(
                 FILTER_KEY.into(),
                 SubscribeRequestFilterTransactions {
+                    failed: Some(false),
                     account_include: filters.transactions_account_include,
                     ..Default::default()
                 },
@@ -1006,6 +1007,7 @@ mod tests {
                 DataType::Transaction => assert_eq!(
                     request.transactions[FILTER_KEY],
                     SubscribeRequestFilterTransactions {
+                        failed: Some(false),
                         account_include: vec!["account-a".into(), "account-b".into()],
                         ..Default::default()
                     }
@@ -1036,7 +1038,10 @@ mod tests {
         assert_eq!(
             subscribe_request(kind(DataType::Transaction, Commitment::Finalized), &filters)
                 .transactions[FILTER_KEY],
-            SubscribeRequestFilterTransactions::default()
+            SubscribeRequestFilterTransactions {
+                failed: Some(false),
+                ..Default::default()
+            }
         );
     }
 
