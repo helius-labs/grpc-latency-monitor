@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  msrv:
+    name: Minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
+  dashboards:
+    name: Dashboards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: grafana/package-lock.json
+      - run: npm --prefix grafana ci
+      - run: npm --prefix grafana run check
+      - name: Generated dashboards are up to date
+        run: |
+          npm --prefix grafana run build
+          git diff --exit-code -- grafana/*.json || {
+            echo "::error::Dashboard JSON is stale: run 'npm --prefix grafana run build' and commit the result."
+            exit 1
+          }
+      - name: Install the clickhouse CLI
+        run: |
+          curl -fsSL https://clickhouse.com/ | sh
+          sudo mv clickhouse /usr/local/bin/clickhouse
+      - run: npm --prefix grafana test
+
+  rollups:
+    name: Rollups integration
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.3
+        env:
+          CLICKHOUSE_DB: benchmark
+          CLICKHOUSE_USER: bench
+          CLICKHOUSE_PASSWORD: bench
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --user bench --password bench --query 'SELECT 1'"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      BENCH_CH_URL: http://127.0.0.1:8123
+      BENCH_CH_USER: bench
+      BENCH_CH_PASSWORD: bench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: grafana/package-lock.json
+      - run: npm --prefix grafana ci
+      - run: cargo build --tests --locked
+      - run: npm --prefix grafana run test:rollups
