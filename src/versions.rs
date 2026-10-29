@@ -73,8 +73,13 @@ pub fn subscription_versions(
                 filters.accounts_owner
             ),
             DataType::Transaction => format!(
-                "transactions.account_include={:?};vote=all;failed=false",
-                filters.transactions_account_include
+                "transactions.account_include={:?};vote=all;failed={}",
+                filters.transactions_account_include,
+                match filters.transactions_failed {
+                    None => "all",
+                    Some(true) => "true",
+                    Some(false) => "false",
+                }
             ),
             DataType::Slot => "slots.filter_by_commitment=false;interslot_updates=true".into(),
         };
@@ -107,7 +112,7 @@ mod tests {
     use crate::config::Config;
 
     #[test]
-    fn request_changes_start_new_histories_without_changing_slot_streams() {
+    fn transaction_aware_accounts_start_new_histories_without_changing_other_streams() {
         let config = Config::example();
         let versions = subscription_versions(
             &config.filters,
@@ -116,9 +121,8 @@ mod tests {
             &config.slot_validation,
             &config.slot_validation.rpc_url().unwrap(),
         );
-        // IDs captured before the account-key and failed-transaction changes, with
-        // the example config and the same synthetic reference URL used by
-        // Config::example().
+        // IDs captured before the account-key change, with the example config
+        // and the same synthetic reference URL used by Config::example().
         let previous = [
             "c0ab45f32d6aef00fdf0f5d586843032d6c7378890a783121b23731cbba50308",
             "ea1538592872de905b063720227d0749d9861b6ee809ee52c82b6f7776c0a5de",
@@ -132,11 +136,37 @@ mod tests {
                 assert!(version.filters.contains(
                     ";nonempty_txn_signature=true;account_key=slot,pubkey,txn_signature"
                 ));
-            } else if index < 4 {
-                assert_ne!(version.id, previous[index]);
-                assert!(version.filters.ends_with(";vote=all;failed=false"));
             } else {
                 assert_eq!(version.id, previous[index]);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_filter_starts_new_transaction_histories_only() {
+        let config = Config::example();
+        let url = config.slot_validation.rpc_url().unwrap();
+        let versions = |filters: &FiltersConfig| {
+            subscription_versions(
+                filters,
+                config.window,
+                &config.providers,
+                &config.slot_validation,
+                &url,
+            )
+        };
+        let all = versions(&config.filters);
+        for (failed, label) in [(Some(false), "false"), (Some(true), "true")] {
+            let mut filters = config.filters.clone();
+            filters.transactions_failed = failed;
+            for (index, (a, b)) in all.iter().zip(versions(&filters)).enumerate() {
+                if StreamKind::ALL[index].data_type == DataType::Transaction {
+                    assert!(a.filters.ends_with(";vote=all;failed=all"));
+                    assert!(b.filters.ends_with(&format!(";vote=all;failed={label}")));
+                    assert_ne!(a.id, b.id);
+                } else {
+                    assert_eq!((&a.id, &a.filters), (&b.id, &b.filters));
+                }
             }
         }
     }
