@@ -1,0 +1,13 @@
+apiVersion: 1
+datasources:
+  - name: Benchmark ClickHouse
+    uid: benchmark-clickhouse
+    type: grafana-clickhouse-datasource
+    jsonData:
+      host: clickhouse
+      port: 8123
+      protocol: http
+      username: benchmark
+      defaultDatabase: benchmark
+    secureJsonData:
+      password: benchmark

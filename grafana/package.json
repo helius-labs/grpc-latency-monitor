@@ -1,0 +1,20 @@
+{
+  "name": "solana-streaming-benchmark-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsx dashboard.ts",
+    "check": "tsc --noEmit",
+    "deploy": "npm run check && npm run build && tsx deploy.ts",
+    "test": "python3 tests/all_streams.py && python3 tests/outages.py && python3 tests/location_map.py",
+    "test:rollups": "python3 tests/rollups.py"
+  },
+  "dependencies": {
+    "@grafana/grafana-foundation-sdk": "0.0.20"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.4",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}

@@ -1,0 +1,14 @@
+/target/
+/.benchmark-state/
+*.local.toml
+*.local.yaml
+*.local.yml
+/config.yaml
+.env
+
+# Dashboard build dependencies
+grafana/node_modules/
+
+# Local tooling and integration tests
+__pycache__/
+*.local.env

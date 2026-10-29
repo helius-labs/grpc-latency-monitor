@@ -1,0 +1,96 @@
+# Keep pending-write minute IDs on persistent storage across restarts. Containers
+# must mount this directory. It stores recovery metadata, not measurement rows.
+state_dir: ".benchmark-state"
+# Independent, trusted Solana HTTP(S) RPC. URL may contain credentials; keep it in
+# the environment. Each commitment uses its own getSlot reference.
+slot_validation:
+  rpc_url_env: BENCH_REFERENCE_RPC_URL
+  # Accept slots within +/- this distance of their commitment's reference.
+  slot_buffer: 25
+# Maximum results per ClickHouse insert; inserts also flush at flush_interval, which
+# bounds latency. Large batches keep inserts (and new parts) to about one per second.
+batch_size: 50000
+# Arrival queue size per data type and commitment, shared by all providers.
+arrival_buffer_capacity: 10000
+# Shared queue for results awaiting ClickHouse; overflow stops certification.
+storage_buffer_capacity: 100000
+# Maximum open comparison windows per data type and commitment. Size for at least
+# peak unique events/sec per stream x (window + processing_grace + 1s).
+matcher_key_capacity: 100000
+flush_interval: "1s"
+# The only comparison window, measured from the first provider's delivery. A provider
+# that has not delivered strictly within it records a missed deadline (`missed`),
+# even if its delivery arrives later. Changing it starts a new configuration ID.
+window: "5s"
+# Matcher queue-drain allowance; does not extend the on-time deadline.
+processing_grace: "2s"
+# After a window closes, remember its key this long so a later delivery is ignored
+# instead of starting a new comparison. Optional; defaults to 2m.
+expired_key_retention: "2m"
+# Closed keys remembered exactly, per stream (about 80 bytes each, allocated only
+# as keys arrive). Defaults to matcher_key_capacity x ceil(expired_key_retention /
+# (window + processing_grace + 1s)), which covers the whole retention at the rate
+# matcher_key_capacity is sized for: 1,500,000 here. Keys forgotten earlier are
+# still ignored through a slot floor, including after normal expiry. Optional.
+# expired_key_capacity: 1500000
+# After each subscription, a provider cannot record a missed deadline (and healthy
+# coverage does not start) for this long: the server may apply the filter after
+# accepting the subscription. Deliveries still count. Optional; defaults to 1s;
+# "0s" disables it.
+connection_warmup: "1s"
+# A processed account or transaction miss waits until its slot is confirmed (then it
+# counts as a missed deadline) or explicitly dead (then it is recorded as
+# forked: the event was on a fork the provider never replayed, not a missed deadline).
+# Misses still undecided after this long count as forked. Optional; defaults to 30s.
+slot_confirmation_timeout: "30s"
+
+filters:
+  # Account updates with a transaction signature, owned by any listed program.
+  # Each (slot, pubkey, transaction signature) is compared separately.
+  # Maximum 100 entries. Same list at both commitments; full account data is requested.
+  # Set [] only with allow_all_accounts: true (default false; much higher bandwidth).
+  accounts_owner:
+    - "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+  # allow_all_accounts: true
+  # Transaction subscription: match transactions mentioning any listed account.
+  # Maximum 100 entries. Set [] only with allow_all_transactions: true (default false).
+  # Votes remain included.
+  transactions_account_include:
+    - "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+  # allow_all_transactions: true
+  # Omit to receive failed and successful transactions; false excludes failed
+  # transactions, true sends only failed ones. Changing it starts new transaction histories.
+  # transactions_failed: false
+  # One unfiltered slot subscription contains every status, independent of commitment.
+  # All providers receive identical requests.
+
+subscriber:
+  # Run one subscriber per region and cloud_provider combination.
+  # Never compare timestamps across subscriber locations.
+  region: "example-region"
+  # Required. Hosting provider, separate from stream providers.
+  cloud_provider: "example-cloud"
+  # Required city/datacenter coordinates. Example: Frankfurt city center.
+  latitude: 50.1109
+  longitude: 8.6821
+
+providers:
+  # Names must be distinct and must not contain ; , " = or @; they appear in ClickHouse
+  # reports. The provider set (names and endpoint URLs, not tokens) is part of each
+  # configuration ID, so changing it starts a new configuration history.
+  - name: "provider-a"
+    url: "https://provider-a.invalid:443"
+    # Name of an environment variable containing the Yellowstone x-token, NOT the token.
+    token_env: "BENCH_PROVIDER_A_TOKEN"
+  - name: "provider-b"
+    url: "https://provider-b.invalid:443"
+    # Omit token_env for a provider without authentication.
+
+clickhouse:
+  # ClickHouse HTTP(S) write endpoint, not the native protocol port.
+  url: "http://clickhouse.invalid:8123"
+  # Create this database and apply Goose migrations before starting the app.
+  database: "benchmark"
+  # Names of environment variables holding credentials; do not put passwords here.
+  user_env: "BENCH_CH_USER"
+  password_env: "BENCH_CH_PASSWORD"
