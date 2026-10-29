@@ -57,10 +57,12 @@ jobs:
             echo "::error::Dashboard JSON is stale: run 'npm --prefix grafana run build' and commit the result."
             exit 1
           }
+      # Same release as compose.yaml and the rollups job, not the moving master build.
       - name: Install the clickhouse CLI
         run: |
-          curl -fsSL https://clickhouse.com/ | sh
-          sudo mv clickhouse /usr/local/bin/clickhouse
+          docker create --name clickhouse clickhouse/clickhouse-server:26.3
+          sudo docker cp -L clickhouse:/usr/bin/clickhouse /usr/local/bin/clickhouse
+          docker rm clickhouse
       - run: npm --prefix grafana test
 
   rollups:
