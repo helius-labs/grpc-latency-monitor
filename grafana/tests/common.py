@@ -10,6 +10,7 @@ import datetime as dt
 import json
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -115,8 +116,11 @@ def render(sql, start=0, end=3600, interval=10, providers=None, anchor=None, **v
 
 
 def clickhouse_local(sql):
-    output = subprocess.check_output(['clickhouse', 'local', '--multiquery', '--query', sql + ' FORMAT JSONEachRow'],
-                                     text=True, stdin=subprocess.DEVNULL)
+    # A fresh data path per run: fixtures must never see another run's databases.
+    with tempfile.TemporaryDirectory() as path:
+        output = subprocess.check_output(['clickhouse', 'local', '--path', path, '--multiquery',
+                                          '--query', sql + ' FORMAT JSONEachRow'],
+                                         text=True, stdin=subprocess.DEVNULL)
     return [json.loads(line) for line in output.splitlines() if line]
 
 
